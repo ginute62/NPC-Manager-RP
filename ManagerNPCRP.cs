@@ -22,7 +22,7 @@ namespace NorsemanNpcRp
     {
         public const string PluginGuid = "Norseman.NPC.RP";
         public const string PluginName = "Norseman NPC RP";
-        public const string PluginVersion = "0.1.0";
+        public const string PluginVersion = "0.2.0";
         internal static ManagerNPCRP Instance { get; private set; }
         private const string ConfigFolderName = "Norseman-NPC-RP";
         private const string DatabaseFileName = "npc_database.json";
@@ -44,6 +44,8 @@ namespace NorsemanNpcRp
             new Dictionary<string, Faction>(StringComparer.OrdinalIgnoreCase);
         private bool _autoSpawnDone;
         private ConfigEntry<KeyCode> _talkKey;
+        private ConfigEntry<KeyCode> _questKey;
+        internal KeyCode QuestKeyValue { get { return _questKey != null ? _questKey.Value : KeyCode.P; } }
         internal NpcDatabase Database { get { return _database; } }
         internal Dictionary<string, NpcDefinition> Npcs { get { return _npcs; } }
         internal ManualLogSource Log { get { return _log; } }
@@ -82,6 +84,8 @@ namespace NorsemanNpcRp
             }
             _talkKey = Config.Bind("Interaction", "TalkKey", KeyCode.T,
                 "Key to talk to the nearest RP NPC (clues depend on reputation and story flags).");
+            _questKey = Config.Bind("Interaction", "QuestKey", KeyCode.P,
+                "Key to open the quest window of the nearest RP NPC (accept / turn in quests). Without an NPC in range it opens the quest journal.");
             try
             {
                 MethodInfo onDeath = AccessTools.Method(typeof(Character), "OnDeath");
@@ -101,14 +105,99 @@ namespace NorsemanNpcRp
             {
                 _log.LogWarning("Reputation patches partly unavailable: " + ex.Message);
             }
+            try
+            {
+                MethodInfo isEnemy = AccessTools.Method(typeof(BaseAI), "IsEnemy",
+                    new[] { typeof(Character), typeof(Character) });
+                if (isEnemy != null)
+                {
+                    _harmony.Patch(isEnemy, postfix: new HarmonyMethod(typeof(ReputationManager),
+                        nameof(ReputationManager.IsEnemyPostfix)));
+                    ReputationManager.EnemyPatchActive = true;
+                }
+                else
+                    _log.LogWarning("BaseAI.IsEnemy not found: career hostility falls back to the global hostile faction variant.");
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning("IsEnemy patch unavailable: " + ex.Message);
+            }
+
+            try
+            {
+                MethodInfo qDeath = AccessTools.Method(typeof(Character), "OnDeath");
+                if (qDeath != null)
+                    _harmony.Patch(qDeath, postfix: new HarmonyMethod(typeof(QuestEngine), nameof(QuestEngine.OnDeathPostfix)));
+                MethodInfo qGame = AccessTools.Method(typeof(Game), "Start");
+                if (qGame != null)
+                    _harmony.Patch(qGame, postfix: new HarmonyMethod(typeof(QuestEngine), nameof(QuestEngine.GameStartPostfix)));
+                // the quest window frees the cursor and freezes player input while open
+                MethodInfo takeInput = AccessTools.Method(typeof(Player), "TakeInput");
+                if (takeInput != null)
+                    _harmony.Patch(takeInput, postfix: new HarmonyMethod(typeof(QuestUi), nameof(QuestUi.TakeInputPostfix)));
+                else _log.LogWarning("Player.TakeInput not found: the quest window will not freeze player input.");
+                MethodInfo mouseCap = AccessTools.Method(typeof(GameCamera), "UpdateMouseCapture");
+                if (mouseCap != null)
+                    _harmony.Patch(mouseCap, prefix: new HarmonyMethod(typeof(QuestUi), nameof(QuestUi.MouseCapturePrefix)));
+                else _log.LogWarning("GameCamera.UpdateMouseCapture not found: the cursor may be recaptured while the quest window is open.");
+
+                // Block game mouse/attack input while the quest UI is open.
+                var inputMethods = AccessTools.GetDeclaredMethods(typeof(ZInput))
+                    .Where(m =>
+                        m.Name == "GetMouseButtonDown" ||
+                        m.Name == "GetMouseButton" ||
+                        m.Name == "GetButtonDown")
+                    .ToList();
+
+                int patchedInputs = 0;
+
+                foreach (MethodInfo inputMethod in inputMethods)
+                {
+                    try
+                    {
+                        _harmony.Patch(
+                            inputMethod,
+                            prefix: new HarmonyMethod(typeof(QuestUi), nameof(QuestUi.BlockGameInputPrefix)));
+
+                        patchedInputs++;
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.LogWarning("Could not patch ZInput." + inputMethod.Name + ": " + ex.Message);
+                    }
+                }
+
+                _log.LogInfo("Quest UI input patches: " + patchedInputs + " ZInput method(s) patched.");
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning("Quest patches partly unavailable: " + ex.Message);
+            }
+
             RegisterCommands();
+            QuestEngine.RegisterCommands();
             _log.LogInfo($"{PluginName} {PluginVersion} loaded.");
         }
         private void Update()
         {
-            if (_talkKey != null && Input.GetKeyDown(_talkKey.Value))
+            
+            if (QuestUi.IsOpen) Input.ResetInputAxes();
+// T = existing dialogue, O = quest window. One interaction per frame, none while the quest window is open.
+            bool talked = false;
+            if (_talkKey != null && !QuestUi.IsOpen && Input.GetKeyDown(_talkKey.Value))
+            {
                 NpcTalk.TryTalk();
+                talked = true;
+            }
+            QuestEngine.Update(talked);
             ReputationManager.ClientTick();
+        }
+        private void OnGUI()
+        {
+            if (!QuestUi.IsOpen) return;
+            GUI.skin.label.richText = true;
+            GUI.skin.label.wordWrap = true;
+            QuestUi.OnGui();
         }
         private void OnDestroy()
         {
@@ -142,6 +231,13 @@ namespace NorsemanNpcRp
                 if (database == null)
                     throw new InvalidDataException("JSON deserialized to null.");
                 bool migrated = false;
+                // Career ids are matched case-insensitively everywhere.
+                database.careers = database.careers == null
+                    ? new Dictionary<string, CareerDefinition>(StringComparer.OrdinalIgnoreCase)
+                    : new Dictionary<string, CareerDefinition>(database.careers, StringComparer.OrdinalIgnoreCase);
+                if (database.reputation != null && database.reputation.repFactions != null)
+                    database.reputation.repFactions =
+                        database.reputation.repFactions.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
                 if (database.schemaVersion == 2)
                 {
                     PopulationManager.MigrateToV3(database);
@@ -149,6 +245,7 @@ namespace NorsemanNpcRp
                     migrated = true;
                 }
                 _database = database;
+                ReputationManager.ClearNpcCache();
                 bool valid = ValidateDatabase(database);
                 if (!valid)
                 {
@@ -160,6 +257,11 @@ namespace NorsemanNpcRp
                 foreach (KeyValuePair<string, NpcDefinition> pair in database.npcs)
                     _npcs.Add(pair.Key, pair.Value);
                 BuildFactionCache(database);
+                _log.LogInfo("Careers loaded: " + (database.careers.Count == 0
+                    ? "NONE (section 'careers' missing or empty in the JSON!)"
+                    : string.Join(", ", database.careers.Keys.ToArray())));
+                CareerManager.Validate(this);
+                QuestEngine.Load(this);
                 if (migrated)
                 {
                     File.Copy(_databasePath, _databasePath + ".v2.bak", true);
@@ -575,6 +677,8 @@ namespace NorsemanNpcRp
         {
             if (Instance != null)
                 Instance._autoSpawnDone = false;   // a new world load must be able to auto-spawn again
+            if (Instance == null)
+                return;
             Instance.StartCoroutine(Instance.AutoSpawnRoutine());
             Instance.StartCoroutine(NpcLifecycle.Run(Instance));
             if (Instance != null)
@@ -647,6 +751,7 @@ namespace NorsemanNpcRp
                 }
                 // m_faction is a local field (not synced by ZDO): every client must set it.
                 ApplyFaction(viking, npc);
+                ApplyGuardBehaviour(viking, npc);
                 // Dialogue text is local too; re-applied once later in case Norsemen overwrites it.
                 ApplyDialogue(viking, npc);
                 StartCoroutine(ReapplyDialogueLater(viking, npc));
@@ -661,6 +766,83 @@ namespace NorsemanNpcRp
                 _log.LogError($"Failed to apply RP data to Viking: {ex}");
             }
         }
+        private bool _guardApiLogged;
+        // Guard + reputation OK  -> Guard/Passive (patrouille tranquille)
+        // Guard + faction hostile -> Guard/Aggressive (cherche des cibles)
+        // Reflection on purpose: VikingAI.SetMovement/SetEmotion are not part of a public API.
+        private void ApplyGuardBehaviour(Viking viking, NpcDefinition npc)
+        {
+            if (viking == null || npc == null)
+                return;
+            bool isGuard =
+                string.Equals(npc.role, "Guard", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(npc.role, "Soldier", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(npc.role, "Watchman", StringComparison.OrdinalIgnoreCase) ||
+                (npc.livingNorsemen != null &&
+                 string.Equals(npc.livingNorsemen.profession, "Guard", StringComparison.OrdinalIgnoreCase));
+            if (!isGuard)
+                return;
+
+            Component ai = null;
+            foreach (Component c in viking.GetComponents<Component>())
+            {
+                if (c != null && c.GetType().Name == "VikingAI") { ai = c; break; }
+            }
+            if (ai == null)
+                return;
+
+            bool hostile = ReputationManager.GuardsHostile(npc);
+            bool m = InvokeEnumSetter(ai, "SetMovement", "Guard");
+            bool e = InvokeEnumSetter(ai, "SetEmotion", hostile ? "Aggressive" : "Passive");
+
+            if (!_guardApiLogged && _database != null && _database.settings.debug)
+            {
+                _guardApiLogged = true;
+                _log.LogInfo($"ApplyGuardBehaviour: SetMovement={(m ? "ok" : "not found")}, " +
+                             $"SetEmotion={(e ? "ok" : "not found")} on {ai.GetType().FullName}");
+            }
+        }
+
+        private static bool InvokeEnumSetter(object target, string method, string valueName)
+        {
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            try
+            {
+                foreach (MethodInfo mi in target.GetType().GetMethods(flags))
+                {
+                    if (mi.Name != method) continue;
+                    ParameterInfo[] ps = mi.GetParameters();
+                    if (ps.Length != 1) continue;
+
+                    Type pt = ps[0].ParameterType;
+                    if (pt.IsEnum)
+                    {
+                        if (!Array.Exists(Enum.GetNames(pt),
+                                n => string.Equals(n, valueName, StringComparison.OrdinalIgnoreCase)))
+                            continue;
+                        mi.Invoke(target, new object[] { Enum.Parse(pt, valueName, true) });
+                        return true;
+                    }
+                    if (pt == typeof(int))
+                    {
+                        // SetMovement -> enum "Movement", SetEmotion -> enum "Emotion"
+                        string enumName = method.StartsWith("Set", StringComparison.Ordinal) ? method.Substring(3) : method;
+                        foreach (Type t in target.GetType().Assembly.GetTypes())
+                        {
+                            if (!t.IsEnum || t.Name != enumName) continue;
+                            if (!Array.Exists(Enum.GetNames(t),
+                                    n => string.Equals(n, valueName, StringComparison.OrdinalIgnoreCase)))
+                                continue;
+                            mi.Invoke(target, new object[] { Convert.ToInt32(Enum.Parse(t, valueName, true)) });
+                            return true;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
         private void BuildFactionCache(NpcDatabase db)
         {
             _factionCache.Clear();
@@ -682,7 +864,7 @@ namespace NorsemanNpcRp
             string factionKey = clan.faction;
             // Opt-in hostility: only NPCs flagged "aggressive" use the hostile variant.
             FactionDefinition factionDef;
-            if (((npc.behavior != null && npc.behavior.aggressive) || ReputationManager.GuardsHostile(npc)) &&
+            if (((npc.behavior != null && npc.behavior.aggressive) || (!ReputationManager.EnemyPatchActive && ReputationManager.GuardsHostile(npc))) &&
                 _database.factions.TryGetValue(clan.faction, out factionDef) &&
                 factionDef != null && !string.IsNullOrWhiteSpace(factionDef.aggressiveVariant))
             {
@@ -777,6 +959,7 @@ namespace NorsemanNpcRp
                 if (last == null || signature != last)
                 {
                     ApplyFaction(viking, npc);
+                ApplyGuardBehaviour(viking, npc);
                     ApplyDialogue(viking, npc);
                     last = signature;
                 }
@@ -886,6 +1069,26 @@ namespace NorsemanNpcRp
         // ---------------------------------------------------------------------
         // COMMANDS
         // ---------------------------------------------------------------------
+        /// <summary>
+        /// Norsemen passes the raw console tokens: ["norsemen", "rp_cmd", arg1, arg2...].
+        /// Returns ["rp_cmd", arg1, arg2...] so that Args[0] = command, Args[1] = first parameter,
+        /// whatever the prefix the console adds.
+        /// </summary>
+        internal static string[] CmdArgs(string[] raw, string cmd)
+        {
+            if (raw == null) return new string[] { cmd };
+            for (int i = 0; i < raw.Length; i++)
+            {
+                if (string.Equals(raw[i], cmd, StringComparison.OrdinalIgnoreCase))
+                {
+                    string[] res = new string[raw.Length - i];
+                    Array.Copy(raw, i, res, 0, res.Length);
+                    return res;
+                }
+            }
+            return raw;
+        }
+
         private void RegisterCommands()
         {
             new NorseCommand(
@@ -947,8 +1150,8 @@ namespace NorsemanNpcRp
                 "Save your position as an NPC point: rp_set_point NPC-001 home|work|patrolB|spawn",
                 args =>
                 {
-                    string id = args.Args.Length > 1 ? args.Args[1] : "";
-                    string kind = args.Args.Length > 2 ? args.Args[2].ToLowerInvariant() : "";
+                    string id = CmdArgs(args.Args, "rp_set_point").Length > 1 ? CmdArgs(args.Args, "rp_set_point")[1] : "";
+                    string kind = CmdArgs(args.Args, "rp_set_point").Length > 2 ? CmdArgs(args.Args, "rp_set_point")[2].ToLowerInvariant() : "";
 
                     NpcDefinition npc;
                     if (Player.m_localPlayer == null || !_npcs.TryGetValue(id, out npc))
@@ -993,7 +1196,7 @@ namespace NorsemanNpcRp
                 "Teleport to an NPC spawn point: rp_tp NPC-001",
                 args =>
                 {
-                    string id = args.Args.Length > 1 ? args.Args[1] : "";
+                    string id = CmdArgs(args.Args, "rp_tp").Length > 1 ? CmdArgs(args.Args, "rp_tp")[1] : "";
                     NpcDefinition npc;
                     if (Player.m_localPlayer == null || !_npcs.TryGetValue(id, out npc) ||
                         npc.locations == null || npc.locations.spawn == null)
@@ -1051,27 +1254,27 @@ namespace NorsemanNpcRp
             new NorseCommand(
                 "rp_scan",
                 "Bake real positions: rp_scan <Clan|NPC-ID|all> [dry] (stand inside the city)",
-                args => { NpcPlacement.ScanCommand(args.Args); return true; },
+                args => { NpcPlacement.ScanCommand(CmdArgs(args.Args, "rp_scan")); return true; },
                 adminOnly: true);
             new NorseCommand(
                 "rp_pop",
                 "Population: rp_pop status|on|off|tick|spawn <Clan> <N>|clear [Clan|all]",
-                args => { PopulationManager.PopCommand(args.Args); return true; },
+                args => { PopulationManager.PopCommand(CmdArgs(args.Args, "rp_pop")); return true; },
                 adminOnly: true);
             new NorseCommand(
                 "rp_groups",
                 "Groups: rp_groups list | rp_groups disband [Clan|all]",
-                args => { PopulationManager.GroupsCommand(args.Args); return true; },
+                args => { PopulationManager.GroupsCommand(CmdArgs(args.Args, "rp_groups")); return true; },
                 adminOnly: true);
             new NorseCommand(
                 "rp_audit",
                 "Server audit of RP NPCs: missing, duplicated, orphaned, non-persistent. 'rp_audit fix' repairs.",
-                args => { NpcLifecycle.AuditCommand(args.Args); return true; },
+                args => { NpcLifecycle.AuditCommand(CmdArgs(args.Args, "rp_audit")); return true; },
                 adminOnly: true);
             new NorseCommand(
                 "rp_check",
                 "Check loaded NPCs in the world: underground, in water, stuck, floating, drifted. rp_check [Clan|NPC-ID|all] [fix]",
-                args => { NpcPlacement.CheckCommand(args.Args); return true; },
+                args => { NpcPlacement.CheckCommand(CmdArgs(args.Args, "rp_check")); return true; },
                 adminOnly: true);
            new NorseCommand(
                 "rp_relay",
@@ -1084,8 +1287,23 @@ namespace NorsemanNpcRp
             new NorseCommand(
                 "rp_career",
                 "Choose your allegiance (once): rp_career renegat|azures|douze|horde|antagoniste  (admin: rp_career force <name>)",
-                args => { ReputationManager.CareerCommand(args.Args); return true; },
+                args => { ReputationManager.CareerCommand(CmdArgs(args.Args, "rp_career")); return true; },
                 adminOnly: false);
+            new NorseCommand(
+                "rp_playercareer",
+                "Assign a career to a player: rp_playercareer <player> <career> (admin client or server).",
+                args => { ReputationManager.BindCommandArgs(CmdArgs(args.Args, "rp_playercareer"), 1); return true; },
+                adminOnly: true);
+            new NorseCommand(
+                "rp_enemies",
+                "Show your career's enemy factions and how many loaded NPCs are hostile to you.",
+                args => { ReputationManager.EnemiesCommand(); return true; },
+                adminOnly: false);
+            new NorseCommand(
+                "rp_listcareer",
+                "List players and their assigned career (admin client or server).",
+                args => { ReputationManager.ListCareerCommand(); return true; },
+                adminOnly: true);
             new NorseCommand(
                 "rp_calendar",
                 "Show this month's objectives for your career (360-day campaign).",
@@ -1094,7 +1312,7 @@ namespace NorsemanNpcRp
             new NorseCommand(
                 "rp_rep",
                 "Reputation: status | month | add|set <Clan|Faction> <pts> [career] | grudge <NPC-ID> [career] | forgive <NPC-ID|all> [career]",
-                args => { ReputationManager.RepCommand(args.Args); return true; },
+                args => { ReputationManager.RepCommand(CmdArgs(args.Args, "rp_rep")); return true; },
                 adminOnly: true);
             new NorseCommand(
                 "rp_journal",
@@ -1104,7 +1322,7 @@ namespace NorsemanNpcRp
             new NorseCommand(
                 "rp_flag",
                 "Story flags (world-wide): rp_flag list | rp_flag set <flag> | rp_flag clear <flag>",
-                args => { DialogueStages.FlagCommand(args.Args); return true; },
+                args => { DialogueStages.FlagCommand(CmdArgs(args.Args, "rp_flag")); return true; },
                 adminOnly: true);
         }
         private void ShowNpcInfo(string id)
@@ -1594,6 +1812,8 @@ namespace NorsemanNpcRp
         public string description;
         public List<string> hubClans = new List<string>();
         public Dictionary<string, float> monthlyDrift = new Dictionary<string, float>();
+        public List<string> aliases = new List<string>();          // alternative names accepted by rp_career / rp_playercareer
+        public List<string> enemyFactions = new List<string>();    // factions whose guards become hostile to this career
         [JsonExtensionData] public IDictionary<string, JToken> extra;   // calendar (12 months)
     }
     [Serializable]
@@ -1628,6 +1848,14 @@ namespace NorsemanNpcRp
         public List<string> tierNames = new List<string> { "Inconnus", "Familiers", "De confiance", "Intimes" };
         public List<RepReward> rewards = new List<RepReward>();
         public ReputationTexts texts = new ReputationTexts();
+        public CareerHostilitySettings careerHostility = new CareerHostilitySettings();
+    }
+    [Serializable]
+    public sealed class CareerHostilitySettings
+    {
+        public string _note;
+        public bool enabled = true;
+        public bool guardsOnly = true;    // false = every NPC of an enemy faction
     }
     public sealed class Ledger
     {
@@ -1650,6 +1878,204 @@ namespace NorsemanNpcRp
     {
         public Dictionary<string, RepWorld> worlds = new Dictionary<string, RepWorld>();
     }
+    // ============================================================
+    // CAREER MANAGER
+    // ============================================================
+    internal static class CareerManager
+    {
+        public enum CareerResult
+        {
+            Ok,
+            UnknownCareer,
+            AlreadyChosen,
+            UnknownPlayer,
+            NotAdmin,
+            InvalidTarget
+        }
+
+        public static void Validate(ManagerNPCRP plugin)
+        {
+            ManagerNPCRP.NpcDatabase db = plugin?.Database;
+            if (db?.careers == null || db.reputation?.repFactions == null) return;
+
+            HashSet<string> factions = new HashSet<string>(
+                db.reputation.repFactions, StringComparer.OrdinalIgnoreCase);
+
+            foreach (KeyValuePair<string, CareerDefinition> kv in db.careers)
+            {
+                string id = kv.Key;
+                CareerDefinition career = kv.Value;
+
+                if (career == null)
+                {
+                    plugin.Log.LogWarning("Career '" + id + "' is null.");
+                    continue;
+                }
+
+                if (string.IsNullOrWhiteSpace(career.faction) || !factions.Contains(career.faction))
+                    plugin.Log.LogWarning("Career '" + id + "': unknown faction '" + career.faction + "'.");
+
+                if (career.hubClans != null)
+                {
+                    foreach (string clan in career.hubClans)
+                    {
+                        if (string.IsNullOrWhiteSpace(clan)) continue;
+
+                        if (!db.clans.ContainsKey(clan))
+                            plugin.Log.LogWarning("Career '" + id + "': unknown hubClan '" + clan + "'.");
+
+                        if (!db.cityZones.ContainsKey(clan) &&
+                            !string.Equals(clan, "Itinerants", StringComparison.OrdinalIgnoreCase))
+                        {
+                            plugin.Log.LogWarning("Career '" + id + "': hubClan '" + clan + "' has no cityZone.");
+                        }
+                    }
+                }
+
+                if (career.enemyFactions != null)
+                {
+                    foreach (string ef in career.enemyFactions)
+                    {
+                        if (!factions.Contains(ef))
+                            plugin.Log.LogWarning("Career '" + id + "': enemyFactions has unknown faction '" + ef + "'.");
+                        else if (string.Equals(ef, career.faction, StringComparison.OrdinalIgnoreCase))
+                            plugin.Log.LogWarning("Career '" + id + "': its own faction '" + ef + "' is listed as enemy (ignored).");
+                    }
+                }
+
+                if (career.monthlyDrift != null)
+                {
+                    foreach (string faction in career.monthlyDrift.Keys)
+                    {
+                        if (!factions.Contains(faction))
+                            plugin.Log.LogWarning("Career '" + id + "': monthlyDrift targets unknown faction '" + faction + "'.");
+                    }
+                }
+            }
+        }
+
+        public static CareerResult Assign(
+            ManagerNPCRP plugin,
+            string targetPlayerName,
+            string careerId,
+            bool adminOverride)
+        {
+            ManagerNPCRP.NpcDatabase db = plugin?.Database;
+            if (db?.careers == null) return CareerResult.UnknownCareer;
+
+            careerId = ReputationManager.ResolveCareerKey(db, careerId) ?? string.Empty;
+            if (!db.careers.ContainsKey(careerId)) return CareerResult.UnknownCareer;
+
+            if (string.IsNullOrWhiteSpace(targetPlayerName)) return CareerResult.InvalidTarget;
+
+            string resolved = ResolveOnlinePlayerName(targetPlayerName);
+            if (resolved == null) return CareerResult.UnknownPlayer;
+
+            RepWorld ws = ReputationManager.GetWorldState();
+            string current = ws.playerCareer.TryGetValue(resolved, out string existing) ? existing : null;
+
+            if (!string.IsNullOrEmpty(current) && !adminOverride)
+                return CareerResult.AlreadyChosen;
+
+            ws.playerCareer[resolved] = careerId;
+            ReputationManager.SaveWorldState();
+
+            return CareerResult.Ok;
+        }
+
+        /// <summary>Exact (case-insensitive) match, else a unique partial match, among online players.</summary>
+        internal static bool TryResolveOnlinePlayer(string requested, out string name, out long uid)
+        {
+            name = null;
+            uid = 0L;
+            if (string.IsNullOrWhiteSpace(requested)) return false;
+
+            List<KeyValuePair<string, long>> all = new List<KeyValuePair<string, long>>();
+            if (Player.m_localPlayer != null && ZNet.instance != null)
+                all.Add(new KeyValuePair<string, long>(Player.m_localPlayer.GetPlayerName(), ZNet.GetUID()));
+            if (ZNet.instance != null)
+                foreach (ZNetPeer peer in ZNet.instance.GetPeers())
+                    all.Add(new KeyValuePair<string, long>(peer.m_playerName, peer.m_uid));
+
+            string wanted = requested.Trim();
+            List<KeyValuePair<string, long>> hit = all
+                .Where(x => string.Equals(x.Key, wanted, StringComparison.OrdinalIgnoreCase)).ToList();
+            if (hit.Count == 0)
+                hit = all.Where(x => x.Key != null &&
+                    x.Key.IndexOf(wanted, StringComparison.OrdinalIgnoreCase) >= 0).ToList();
+            if (hit.Count != 1) return false;
+
+            name = hit[0].Key;
+            uid = hit[0].Value;
+            return true;
+        }
+
+        private static string ResolveOnlinePlayerName(string requested)
+        {
+            if (string.IsNullOrWhiteSpace(requested)) return null;
+
+            string wanted = requested.Trim();
+            List<string> matches = new List<string>();
+
+            if (Player.m_localPlayer != null)
+            {
+                string localName = Player.m_localPlayer.GetPlayerName();
+                if (string.Equals(localName, wanted, StringComparison.OrdinalIgnoreCase))
+                    matches.Add(localName);
+            }
+
+            if (ZNet.instance != null)
+            {
+                foreach (ZNetPeer peer in ZNet.instance.GetPeers())
+                {
+                    if (string.Equals(peer.m_playerName, wanted, StringComparison.OrdinalIgnoreCase))
+                        matches.Add(peer.m_playerName);
+                }
+            }
+
+            return matches.Count == 1 ? matches[0] : null;
+        }
+
+        public static string ResolveSenderName(long sender, string claimedName)
+        {
+            if (ZNet.instance == null) return null;
+
+            if (sender == ZNet.GetUID() && Player.m_localPlayer != null)
+            {
+                string localName = Player.m_localPlayer.GetPlayerName();
+                return string.Equals(localName, claimedName, StringComparison.OrdinalIgnoreCase)
+                    ? localName
+                    : null;
+            }
+
+            foreach (ZNetPeer peer in ZNet.instance.GetPeers())
+            {
+                if (peer.m_uid != sender) continue;
+
+                return string.Equals(peer.m_playerName, claimedName, StringComparison.OrdinalIgnoreCase)
+                    ? peer.m_playerName
+                    : null;
+            }
+
+            return null;
+        }
+
+        public static bool IsSenderAdmin(long sender)
+        {
+            if (ZNet.instance == null) return false;
+
+            if (sender == ZNet.GetUID()) return true;
+
+            foreach (ZNetPeer peer in ZNet.instance.GetPeers())
+            {
+                if (peer.m_uid != sender) continue;
+                return ZNet.instance.IsAdmin(peer.m_socket.GetHostName());
+            }
+
+            return false;
+        }
+    }
+
     internal static class ReputationManager
     {
         private const string RpIdKey = "NorsemanNPC_RP_ID";
@@ -1799,6 +2225,16 @@ namespace NorsemanNpcRp
                 ManagerNPCRP.Instance?.Log.LogWarning("Reputation state not saved: " + ex.Message);
             }
         }
+        internal static RepWorld GetWorldState()
+        {
+            return Ws();
+        }
+
+        internal static void SaveWorldState()
+        {
+            Save();
+        }
+
 
         // ============================================================ points
 
@@ -2084,6 +2520,11 @@ namespace NorsemanNpcRp
             ZRoutedRpc.instance.Register<string, string>("RP_Notice", RpcNotice);
             ZRoutedRpc.instance.Register<string, string>("RP_Career", RpcCareer);
             ZRoutedRpc.instance.Register<string, string, string>("RP_Death", RpcDeath);
+            ZRoutedRpc.instance.Register<string, string>("RP_Bind", RpcBind);
+            ZRoutedRpc.instance.Register<string>("RP_SetCareer", RpcSetCareer);
+            ZRoutedRpc.instance.Register<string>("RP_Msg", RpcMsg);
+            ZRoutedRpc.instance.Register<string>("RP_List", RpcList);
+            ZRoutedRpc.instance.Register<string>("RP_Lines", RpcLines);
         }
 
         private static void RpcNotice(long sender, string career, string text)
@@ -2095,8 +2536,29 @@ namespace NorsemanNpcRp
         // Server: a player told us which career he chose.
         private static void RpcCareer(long sender, string playerName, string career)
         {
-            if (ZNet.instance == null || !ZNet.instance.IsServer() || Db == null || !Db.careers.ContainsKey(career)) return;
-            Ws().playerCareer[playerName] = career;
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+
+            ManagerNPCRP.NpcDatabase db = Db;
+            if (db == null) return;
+            career = ResolveCareerKey(db, career);
+            if (career == null) return;
+
+            string resolvedPlayer = CareerManager.ResolveSenderName(sender, playerName);
+            if (resolvedPlayer == null)
+            {
+                ManagerNPCRP.Instance?.Log.LogWarning(
+                    "RPCareer rejected: sender " + sender + " does not match player '" + playerName + "'.");
+                return;
+            }
+
+            RepWorld ws = Ws();
+            string current = ws.playerCareer.TryGetValue(resolvedPlayer, out string existing) ? existing : null;
+
+            bool isAdmin = CareerManager.IsSenderAdmin(sender);
+
+            if (!string.IsNullOrEmpty(current) && !isAdmin) return;
+
+            ws.playerCareer[resolvedPlayer] = career;
             Save();
         }
 
@@ -2193,6 +2655,14 @@ namespace NorsemanNpcRp
             Player lp = Player.m_localPlayer;
             if (lp == null || ZRoutedRpc.instance == null || Db == null) return;
 
+            ZNetView pview = lp.GetComponent<ZNetView>();
+            if (pview != null && pview.IsValid() && pview.IsOwner())
+            {
+                ZDO pz = pview.GetZDO();
+                string mine = HasChosenCareer() ? LocalCareer() : "";
+                if (pz != null && pz.GetString(CareerKey, "") != mine) pz.Set(CareerKey, mine);
+            }
+
             if (HasChosenCareer())
             {
                 if (!_announced)
@@ -2218,19 +2688,81 @@ namespace NorsemanNpcRp
             ManagerNPCRP.NpcDatabase db = plugin.Database;
 
             string arg = args.Length > 1 ? args[1].ToLowerInvariant() : "list";
+            if (arg == "bind") { BindCommandArgs(args, 2); return; }
+
             if (arg == "list")
             {
                 foreach (KeyValuePair<string, CareerDefinition> kv in db.careers)
-                    plugin.Log.LogInfo("  " + kv.Key + " - " + kv.Value.name + " : " + kv.Value.description);
-                lp.Message(MessageHud.MessageType.TopLeft, "Allégeance actuelle : " + (HasChosenCareer() ? LocalCareer() : "aucune"));
+                    Out("  " + kv.Key + " - " + kv.Value.name + " : " + kv.Value.description);
+
+                lp.Message(MessageHud.MessageType.TopLeft,
+                    "Allégeance actuelle : " + (HasChosenCareer() ? LocalCareer() : "aucune"));
                 return;
             }
 
+            bool bind = arg == "bind";
             bool force = arg == "force";
-            string choice = force ? (args.Length > 2 ? args[2].ToLowerInvariant() : "") : arg;
+
+            if (bind)
+            {
+                if (args.Length < 4)
+                {
+                    lp.Message(MessageHud.MessageType.TopLeft,
+                        "Usage : rp_career bind <joueur> <carrière>");
+                    return;
+                }
+
+                if (!(ZNet.instance != null && ZNet.instance.LocalPlayerIsAdminOrHost()))
+                {
+                    lp.Message(MessageHud.MessageType.TopLeft, "Réservé aux administrateurs.");
+                    return;
+                }
+
+                if (!(ZNet.instance != null && ZNet.instance.IsServer()))
+                {
+                    lp.Message(MessageHud.MessageType.TopLeft,
+                        "rp_career bind doit être exécuté sur l'hôte/serveur.");
+                    return;
+                }
+
+                string targetPlayer = args[2];
+                string targetCareer = args[3];
+
+                CareerManager.CareerResult result = CareerManager.Assign(
+                    plugin, targetPlayer, targetCareer, adminOverride: true);
+
+                string message;
+                switch (result)
+                {
+                    case CareerManager.CareerResult.Ok:
+                        message = "Carrière '" + targetCareer + "' attribuée à " + targetPlayer + ".";
+                        break;
+                    case CareerManager.CareerResult.UnknownCareer:
+                        message = "Carrière inconnue : " + targetCareer;
+                        break;
+                    case CareerManager.CareerResult.UnknownPlayer:
+                        message = "Joueur introuvable ou ambigu : " + targetPlayer;
+                        break;
+                    case CareerManager.CareerResult.AlreadyChosen:
+                        message = targetPlayer + " a déjà une carrière.";
+                        break;
+                    default:
+                        message = "Attribution refusée.";
+                        break;
+                }
+
+                lp.Message(MessageHud.MessageType.TopLeft, message);
+                return;
+            }
+
+            string choiceRaw = force ? (args.Length > 2 ? args[2] : "") : arg;
+            string choice = ResolveCareerKey(db, choiceRaw) ?? choiceRaw;
+
             if (!db.careers.ContainsKey(choice))
             {
-                lp.Message(MessageHud.MessageType.TopLeft, "Allégeance inconnue : " + choice);
+                Out("Allégeance inconnue : '" + choiceRaw + "'. Disponibles : " + CareerList(db) +
+                    " (" + db.careers.Count + " carrière(s) chargée(s))");
+                lp.Message(MessageHud.MessageType.TopLeft, "Allégeance inconnue : " + choiceRaw + " (voir console F5)");
                 return;
             }
 
@@ -2246,9 +2778,280 @@ namespace NorsemanNpcRp
                 return;
             }
 
+            if (ZRoutedRpc.instance != null)
+            {
+                ZRoutedRpc.instance.InvokeRoutedRPC(
+                    RpcAccess.ServerPeerId(),
+                    "RP_Career",
+                    lp.GetPlayerName(),
+                    choice);
+            }
+
             lp.m_customData[CareerKey] = choice;
             _announced = false;
             lp.Message(MessageHud.MessageType.Center, "Allégeance : " + db.careers[choice].name);
+        }
+        // ============================================================ career resolution + bind
+
+        private static void Out(string text)
+        {
+            ManagerNPCRP plugin = ManagerNPCRP.Instance;
+            if (plugin != null) plugin.Log.LogInfo(text);
+            if (Console.instance != null) Console.instance.Print(text);
+        }
+
+        private static string Fold(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            string d = s.Trim().ToLowerInvariant().Normalize(System.Text.NormalizationForm.FormD);
+            System.Text.StringBuilder sb = new System.Text.StringBuilder();
+            foreach (char c in d)
+                if (System.Globalization.CharUnicodeInfo.GetUnicodeCategory(c) !=
+                    System.Globalization.UnicodeCategory.NonSpacingMark)
+                    sb.Append(c);
+            return sb.ToString();
+        }
+
+        /// <summary>Maps user input (key, display name, accents/case ignored, unique prefix) to the real career key.</summary>
+        internal static string ResolveCareerKey(ManagerNPCRP.NpcDatabase db, string input)
+        {
+            if (db == null || db.careers == null || string.IsNullOrWhiteSpace(input)) return null;
+            string want = Fold(input);
+            foreach (KeyValuePair<string, CareerDefinition> kv in db.careers)
+                if (Fold(kv.Key) == want) return kv.Key;
+            foreach (KeyValuePair<string, CareerDefinition> kv in db.careers)
+                if (kv.Value != null && Fold(kv.Value.name) == want) return kv.Key;
+
+            foreach (KeyValuePair<string, CareerDefinition> kv in db.careers)
+            {
+                if (kv.Value == null || kv.Value.aliases == null) continue;
+                foreach (string al in kv.Value.aliases)
+                    if (Fold(al) == want) return kv.Key;
+            }
+
+            string found = null;
+            foreach (KeyValuePair<string, CareerDefinition> kv in db.careers)
+            {
+                if (!Fold(kv.Key).StartsWith(want, StringComparison.Ordinal)) continue;
+                if (found != null) return null;   // ambiguous prefix
+                found = kv.Key;
+            }
+            return found;
+        }
+
+        internal static string CareerList(ManagerNPCRP.NpcDatabase db)
+        {
+            return db == null || db.careers == null || db.careers.Count == 0
+                ? "(aucune)" : string.Join(" | ", db.careers.Keys.ToArray());
+        }
+
+        /// <summary>rp_bind / rp_career bind: args[first..n-2] = player name (spaces allowed), args[n-1] = career.</summary>
+        internal static void BindCommandArgs(string[] args, int first)
+        {
+            if (args == null || args.Length - first < 2)
+            {
+                Out("Usage : rp_playercareer <joueur> <carrière>   (carrières : " + CareerList(Db) + ")");
+                return;
+            }
+            string career = args[args.Length - 1];
+            string player = string.Join(" ", args.Skip(first).Take(args.Length - first - 1).ToArray());
+            BindCommand(player, career);
+        }
+
+        internal static void BindCommand(string playerName, string careerInput)
+        {
+            ManagerNPCRP plugin = ManagerNPCRP.Instance;
+            if (plugin == null || plugin.Database == null) return;
+            ManagerNPCRP.NpcDatabase db = plugin.Database;
+
+            string career = ResolveCareerKey(db, careerInput);
+            if (career == null)
+            {
+                Out("Carrière inconnue : '" + careerInput + "'. Disponibles : " + CareerList(db));
+                return;
+            }
+
+            if (ZNet.instance != null && ZNet.instance.IsServer())
+            {
+                Out(DoBind(plugin, playerName, career));
+                return;
+            }
+
+            if (ZRoutedRpc.instance == null) return;
+            ZRoutedRpc.instance.InvokeRoutedRPC(RpcAccess.ServerPeerId(), "RP_Bind", playerName, career);
+            Out("Demande d'attribution envoyée au serveur...");
+        }
+
+        // Server: record the career AND push it to the target client (the client reads it from its own save).
+        private static string DoBind(ManagerNPCRP plugin, string playerName, string career)
+        {
+            string resolved;
+            long uid;
+            if (!CareerManager.TryResolveOnlinePlayer(playerName, out resolved, out uid))
+                return "Joueur introuvable ou ambigu : " + playerName;
+
+            CareerManager.CareerResult res = CareerManager.Assign(plugin, resolved, career, true);
+            if (res != CareerManager.CareerResult.Ok)
+                return "Attribution refusée (" + res + ").";
+
+            if (ZRoutedRpc.instance != null)
+                if (uid == ZNet.GetUID() && Player.m_localPlayer != null)
+                    RpcSetCareer(uid, career);
+                else
+                    ZRoutedRpc.instance.InvokeRoutedRPC(uid, "RP_SetCareer", career);
+            return resolved + " est désormais lié à la carrière '" + career + "'.";
+        }
+
+        // Server: an admin client asked for a bind.
+        private static void RpcBind(long sender, string playerName, string careerInput)
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer()) return;
+            ManagerNPCRP plugin = ManagerNPCRP.Instance;
+            if (plugin == null || plugin.Database == null) return;
+
+            string msg;
+            if (!CareerManager.IsSenderAdmin(sender))
+                msg = "Réservé aux administrateurs.";
+            else
+            {
+                string key = ResolveCareerKey(plugin.Database, careerInput);
+                msg = key == null ? "Carrière inconnue : " + careerInput
+                                  : DoBind(plugin, playerName, key);
+            }
+
+            plugin.Log.LogInfo("[RP_Bind] from " + sender + ": " + msg);
+            if (ZRoutedRpc.instance != null)
+                ZRoutedRpc.instance.InvokeRoutedRPC(sender, "RP_Msg", msg);
+        }
+
+        // Client: feedback from the server.
+        private static void RpcMsg(long sender, string text)
+        {
+            if (Player.m_localPlayer != null)
+                Player.m_localPlayer.Message(MessageHud.MessageType.TopLeft, text);
+            Out(text);
+        }
+
+        // Client: the server assigned my career.
+        private static void RpcSetCareer(long sender, string career)
+        {
+            Player lp = Player.m_localPlayer;
+            if (lp == null || Db == null) return;
+
+            bool iAmServer = ZNet.instance != null && ZNet.instance.IsServer();
+            long serverId = RpcAccess.ServerPeerId();
+            if (!iAmServer && serverId != ZRoutedRpc.Everybody && sender != serverId) return;   // only the server may assign
+
+            string key = ResolveCareerKey(Db, career);
+            if (key == null) return;
+
+            lp.m_customData[CareerKey] = key;
+            _announced = false;
+            lp.Message(MessageHud.MessageType.Center, "Allégeance : " + Db.careers[key].name);
+        }
+
+        // ============================================================ rp_listcareer
+
+        private static string CareerLabel(ManagerNPCRP.NpcDatabase db, string career)
+        {
+            CareerDefinition cd;
+            return db != null && db.careers != null && db.careers.TryGetValue(career ?? "", out cd) && cd != null &&
+                   !string.IsNullOrEmpty(cd.name) ? career + " (" + cd.name + ")" : career;
+        }
+
+        // Server only: online players first, then players known from earlier sessions.
+        private static List<string> BuildCareerLines()
+        {
+            ManagerNPCRP.NpcDatabase db = Db;
+            RepWorld ws = Ws();
+            List<string> lines = new List<string>();
+            lines.Add("===== CARRIÈRES DES JOUEURS =====");
+
+            HashSet<string> online = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (KeyValuePair<string, Vector3> p in Players())
+            {
+                if (!online.Add(p.Key)) continue;
+                string c;
+                bool has = ws.playerCareer.TryGetValue(p.Key, out c) && !string.IsNullOrEmpty(c);
+                lines.Add("  [en ligne]   " + p.Key + " => " + (has ? CareerLabel(db, c) : "(aucune)"));
+            }
+            foreach (KeyValuePair<string, string> kv in ws.playerCareer)
+                if (!online.Contains(kv.Key))
+                    lines.Add("  [hors ligne] " + kv.Key + " => " + CareerLabel(db, kv.Value));
+
+            if (lines.Count == 1) lines.Add("  (aucun joueur)");
+            return lines;
+        }
+
+        internal static void ListCareerCommand()
+        {
+            ManagerNPCRP plugin = ManagerNPCRP.Instance;
+            if (plugin == null || plugin.Database == null) return;
+
+            if (ZNet.instance != null && ZNet.instance.IsServer())
+            {
+                foreach (string l in BuildCareerLines()) Out(l);
+                if (Player.m_localPlayer != null)
+                    Player.m_localPlayer.Message(MessageHud.MessageType.TopLeft, "Carrières : voir console (F5)");
+                return;
+            }
+
+            if (ZRoutedRpc.instance == null) return;
+            ZRoutedRpc.instance.InvokeRoutedRPC(RpcAccess.ServerPeerId(), "RP_List", "");
+            Out("Demande de liste envoyée au serveur...");
+        }
+
+        // Server: an admin client asked for the list.
+        private static void RpcList(long sender, string unused)
+        {
+            if (ZNet.instance == null || !ZNet.instance.IsServer() || ZRoutedRpc.instance == null) return;
+            if (ManagerNPCRP.Instance == null || ManagerNPCRP.Instance.Database == null) return;
+
+            if (!CareerManager.IsSenderAdmin(sender))
+            {
+                ZRoutedRpc.instance.InvokeRoutedRPC(sender, "RP_Msg", "Réservé aux administrateurs.");
+                return;
+            }
+            ZRoutedRpc.instance.InvokeRoutedRPC(sender, "RP_Lines", string.Join("\n", BuildCareerLines().ToArray()));
+        }
+
+        // Client: multi-line answer from the server.
+        private static void RpcLines(long sender, string text)
+        {
+            if (string.IsNullOrEmpty(text)) return;
+            foreach (string l in text.Split('\n')) Out(l);
+            if (Player.m_localPlayer != null)
+                Player.m_localPlayer.Message(MessageHud.MessageType.TopLeft, "Carrières : voir console (F5)");
+        }
+
+        internal static void PlayerCareerCommand()
+        {
+            ManagerNPCRP plugin = ManagerNPCRP.Instance;
+            if (plugin == null)
+                return;
+
+            if (ZNet.instance == null || !ZNet.instance.IsServer())
+            {
+                plugin.Log.LogInfo("rp_playercareer must run on the host/server (careers are stored server-side).");
+                if (Player.m_localPlayer != null)
+                    Player.m_localPlayer.Message(MessageHud.MessageType.TopLeft, "rp_playercareer : hôte/serveur uniquement");
+                return;
+            }
+
+            RepWorld ws = Ws();
+            List<string> lines = new List<string>();
+            lines.Add("===== PLAYER CAREERS =====");
+            if (ws.playerCareer.Count == 0)
+                lines.Add("No registered careers.");
+            else
+                foreach (KeyValuePair<string, string> kv in ws.playerCareer)
+                    lines.Add(kv.Key + " => " + kv.Value);
+
+            foreach (string l in lines)
+            {
+                plugin.Log.LogInfo(l);
+                if (Console.instance != null) Console.instance.Print(l);
+            }
         }
 
         internal static void CalendarCommand()
@@ -2309,13 +3112,163 @@ namespace NorsemanNpcRp
         internal static bool GuardsHostile(ManagerNPCRP.NpcDefinition npc)
         {
             ReputationSettings r = Cfg;
-            if (r == null || !r.enabled || npc == null || npc.livingNorsemen == null) return false;
-            if (npc.livingNorsemen.profession != "Guard") return false;
+            if (r == null || !r.enabled || npc == null) return false;
+            bool isGuard =
+                string.Equals(npc.role, "Guard", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(npc.role, "Soldier", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(npc.role, "Watchman", StringComparison.OrdinalIgnoreCase) ||
+                (npc.livingNorsemen != null &&
+                 string.Equals(npc.livingNorsemen.profession, "Guard", StringComparison.OrdinalIgnoreCase));
+            if (!isGuard) return false;
 
             string rf = RepFactionOf(npc);
             if (string.IsNullOrEmpty(rf) || rf == "Vagabonds" || npc.clan == "Itinerants") return false;
-            return DialogueStages.FlagOn("repfhostile_" + rf) ||
+            return CareerEnemy(LocalCareer(), npc, rf) ||
+                   DialogueStages.FlagOn("repfhostile_" + rf) ||
                    (!string.IsNullOrEmpty(npc.clan) && DialogueStages.FlagOn("rephostile_" + npc.clan));
+        }
+
+        // ============================================================ career-based hostility
+
+        /// <summary>True once Harmony has patched BaseAI.IsEnemy (per-player hostility replaces the global hostile faction variant).</summary>
+        internal static bool EnemyPatchActive;
+
+        internal static bool IsGuardNpc(ManagerNPCRP.NpcDefinition npc)
+        {
+            if (npc == null) return false;
+            return string.Equals(npc.role, "Guard", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(npc.role, "Soldier", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(npc.role, "Watchman", StringComparison.OrdinalIgnoreCase) ||
+                   (npc.livingNorsemen != null &&
+                    string.Equals(npc.livingNorsemen.profession, "Guard", StringComparison.OrdinalIgnoreCase));
+        }
+
+        /// <summary>The faction of this NPC is listed in careers.&lt;career&gt;.enemyFactions (never the career's own faction, never Vagabonds).</summary>
+        internal static bool CareerEnemy(string career, ManagerNPCRP.NpcDefinition npc, string rf)
+        {
+            ReputationSettings r = Cfg;
+            if (r == null || !r.enabled || r.careerHostility == null || !r.careerHostility.enabled) return false;
+            if (npc == null || Db == null || string.IsNullOrEmpty(rf) || rf == "Vagabonds" || npc.clan == "Itinerants") return false;
+
+            CareerDefinition cd;
+            if (string.IsNullOrEmpty(career) || !Db.careers.TryGetValue(career, out cd) || cd == null ||
+                cd.enemyFactions == null) return false;
+            if (string.Equals(cd.faction, rf, StringComparison.OrdinalIgnoreCase)) return false;
+
+            foreach (string f in cd.enemyFactions)
+                if (string.Equals(f, rf, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        /// <summary>Would this NPC treat a player of that career as an enemy? (career rivalry OR hostile reputation flags)</summary>
+        internal static bool NpcHostileToCareer(string career, ManagerNPCRP.NpcDefinition npc)
+        {
+            ReputationSettings r = Cfg;
+            if (r == null || !r.enabled || npc == null) return false;
+
+            string rf = RepFactionOf(npc);
+            if (string.IsNullOrEmpty(rf) || rf == "Vagabonds" || npc.clan == "Itinerants") return false;
+            if ((r.careerHostility == null || r.careerHostility.guardsOnly) && !IsGuardNpc(npc)) return false;
+
+            if (CareerEnemy(career, npc, rf)) return true;
+            return DialogueStages.RawOn("repfhostile_" + career + "_" + rf) ||
+                   (!string.IsNullOrEmpty(npc.clan) && DialogueStages.RawOn("rephostile_" + career + "_" + npc.clan));
+        }
+
+        /// <summary>Career of any player: local one from its save, remote ones from their player ZDO (published by ClientTick).</summary>
+        internal static string CareerOfPlayer(Player p)
+        {
+            if (p == null) return DefaultCareer;
+            if (p == Player.m_localPlayer) return LocalCareer();
+            ZNetView nv = p.GetComponent<ZNetView>();
+            string c = nv != null && nv.GetZDO() != null ? nv.GetZDO().GetString(CareerKey, "") : "";
+            return string.IsNullOrEmpty(c) ? DefaultCareer : c;
+        }
+
+        // IsEnemy is called very often by the AI: resolve each Viking's NpcDefinition once.
+        private static readonly Dictionary<int, ManagerNPCRP.NpcDefinition> NpcCache =
+            new Dictionary<int, ManagerNPCRP.NpcDefinition>();
+
+        internal static void ClearNpcCache() { NpcCache.Clear(); }
+
+        private static ManagerNPCRP.NpcDefinition NpcOfViking(Viking v)
+        {
+            int key = v.GetInstanceID();
+            ManagerNPCRP.NpcDefinition npc;
+            if (NpcCache.TryGetValue(key, out npc)) return npc;
+
+            if (NpcCache.Count > 3000) NpcCache.Clear();   // destroyed NPCs leave stale ids: start over
+
+            npc = null;
+            ZNetView nv = v.GetComponent<ZNetView>();
+            ZDO zdo = nv != null ? nv.GetZDO() : null;
+            ManagerNPCRP plugin = ManagerNPCRP.Instance;
+            if (zdo != null && plugin != null)
+            {
+                string id = zdo.GetString(RpIdKey, "");
+                if (id.Length > 0 && !plugin.Npcs.TryGetValue(id, out npc))
+                    PopulationManager.TryResolveGenerated(zdo, id, out npc);
+            }
+            if (zdo != null) NpcCache[key] = npc;   // not cached while the ZDO is not ready yet
+            return npc;
+        }
+
+        // Harmony postfix on BaseAI.IsEnemy(Character, Character): decided PER PLAYER, on whichever client owns the AI.
+        internal static void IsEnemyPostfix(Character __0, Character __1, ref bool __result)
+        {
+            if (__result) return;
+            try
+            {
+                Player p = __0 as Player;
+                Viking v = __1 as Viking;
+                if (p == null || v == null) { p = __1 as Player; v = __0 as Viking; }
+                if (p == null || v == null) return;
+
+                ManagerNPCRP.NpcDefinition npc = NpcOfViking(v);
+                if (npc == null) return;
+
+                if (NpcHostileToCareer(CareerOfPlayer(p), npc)) __result = true;
+            }
+            catch { }
+        }
+
+        internal static void EnemiesCommand()
+        {
+            ManagerNPCRP plugin = ManagerNPCRP.Instance;
+            if (plugin == null || plugin.Database == null) return;
+
+            string career = LocalCareer();
+            CareerDefinition cd;
+            plugin.Database.careers.TryGetValue(career, out cd);
+
+            Out("Carrière : " + career + (HasChosenCareer() ? "" : " (par défaut : aucune choisie)"));
+            Out("Factions ennemies : " + (cd != null && cd.enemyFactions != null && cd.enemyFactions.Count > 0
+                ? string.Join(", ", cd.enemyFactions.ToArray()) : "(aucune)"));
+            Out("Patch BaseAI.IsEnemy : " + (EnemyPatchActive ? "actif" : "INACTIF (méthode introuvable)"));
+
+            int guards = 0, hostile = 0;
+            Dictionary<string, int> byFaction = new Dictionary<string, int>();
+            foreach (Character c in Character.GetAllCharacters())
+            {
+                Viking v = c as Viking;
+                if (v == null || v.IsDead()) continue;
+                string id = IdOf(v);
+                if (id.Length == 0) continue;
+
+                ZNetView nv = v.GetComponent<ZNetView>();
+                ManagerNPCRP.NpcDefinition npc = null;
+                if (!plugin.Npcs.TryGetValue(id, out npc) &&
+                    !PopulationManager.TryResolveGenerated(nv != null ? nv.GetZDO() : null, id, out npc)) continue;
+                if (npc == null) continue;
+
+                if (IsGuardNpc(npc)) guards++;
+                if (!NpcHostileToCareer(career, npc)) continue;
+                hostile++;
+                string rf = RepFactionOf(npc) ?? "?";
+                int n; byFaction.TryGetValue(rf, out n); byFaction[rf] = n + 1;
+            }
+            Out("PNJ chargés : " + guards + " gardes, " + hostile + " hostile(s)" +
+                (byFaction.Count > 0 ? " (" + string.Join(", ", byFaction.Select(kv => kv.Key + " " + kv.Value).ToArray()) + ")" : "") + ".");
         }
 
         internal static string StateSignature(string id, ManagerNPCRP.NpcDefinition npc)
@@ -2529,7 +3482,7 @@ namespace NorsemanNpcRp
             return p.m_customData.TryGetValue(TalksPrefix + id, out raw) && int.TryParse(raw, out n) ? n : 0;
         }
         // No Player.TakeInput() (not accessible): look for an open chat / console / menu through reflection.
-        private static bool UiBlocked()
+        internal static bool UiBlocked()
         {
             try
             {
@@ -2571,7 +3524,21 @@ namespace NorsemanNpcRp
                     !PopulationManager.TryResolveGenerated(nv.GetZDO(), id, out npc)) continue;
                 best = v; bestId = id; bestNpc = npc; bestD = d;
             }
-            if (best != null) Talk(lp, best, bestId, bestNpc);
+            if (best != null)
+            {
+                if (plugin.Database.settings.debug)
+                {
+                    plugin.Log.LogInfo("[RP TALK] " + bestId + " distance=" + bestD.ToString("0.0") +
+                                       " clan=" + bestNpc.clan + " refusing=" +
+                                       ReputationManager.IsRefusing(bestId, bestNpc.clan));
+                }
+                Talk(lp, best, bestId, bestNpc);
+                QuestEngine.AfterTalk(bestId);
+            }
+            else if (plugin.Database.settings.debug)
+            {
+                plugin.Log.LogInfo("[RP TALK] no RP NPC within 3.5 m.");
+            }
         }
         private static void Talk(Player lp, Viking v, string id, ManagerNPCRP.NpcDefinition npc)
         {
@@ -2658,6 +3625,7 @@ namespace NorsemanNpcRp
                 List<KnowEntry> knows = ParseKnows(npc);
                 if (idx < knows.Count) lines.Add("  [" + npc.identity.name + "] " + knows[idx].text);
             }
+            QuestEngine.AppendJournal(lines);
             foreach (string l in lines)
             {
                 if (Console.instance != null) Console.instance.Print(l);
@@ -4073,6 +5041,939 @@ namespace NorsemanNpcRp
                 zdo.Set(StringExtensionMethods.GetStableHashCode("patrolPoint"), point);
                 zdo.Set(StringExtensionMethods.GetStableHashCode("patrol"), true);
             }
+        }
+    }
+    // =====================================================================
+    // QUEST ENGINE  (definitions live in npc_database.json -> "questLines")
+    //   * per-player state  : Player.m_customData  "RP_QS_<questId>"  = "A;obj=n,obj=n" | "C"
+    //   * narrative flags   : ZoneSystem global keys "rp_<flag>" (world-wide, same as the rest of the mod)
+    //   * reputation        : reputation.rewards rows keyed on the flag "q_<career>_<questId>" (server pays once)
+    // =====================================================================
+    internal enum QuestState { Locked, Available, Active, Ready, Completed }
+
+    internal sealed class QObjective
+    {
+        public string id, type, text, npc, item, flag, quest, label;
+        public List<string> targets = new List<string>();
+        public int count = 1;
+        public float x, z, radius;
+    }
+
+    internal sealed class QDef
+    {
+        public string id, chain, name, description, clan, faction, biome, turnIn;
+        public int order, tier, minRepTier, repClanPoints;
+        public List<string> givers = new List<string>(), careers = new List<string>(), prevQuests = new List<string>();
+        public List<string> flags = new List<string>(), notFlags = new List<string>(), next = new List<string>(), rewardFlags = new List<string>();
+        public List<QObjective> objectives = new List<QObjective>();
+        public Dictionary<string, string> dlg = new Dictionary<string, string>();
+        public List<KeyValuePair<string, int>> rewardItems = new List<KeyValuePair<string, int>>();
+        public string disabled;   // null = usable; otherwise the reason (shown in logs / journal)
+    }
+
+    internal sealed class QChain { public string id, title, clan, faction, biome; }
+
+    internal static class QuestEngine
+    {
+        private const string StatePrefix = "RP_QS_";
+        private const string RpIdKey = "NorsemanNPC_RP_ID";
+        private static readonly string[] ObjTypes = { "kill", "collect", "deliver", "visit", "talk", "flag", "quest" };
+        private static readonly FieldInfo LastHit = typeof(Character).GetField("m_lastHit",
+            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+
+        internal static readonly List<QDef> Ordered = new List<QDef>();
+        internal static readonly Dictionary<string, QDef> Quests = new Dictionary<string, QDef>(StringComparer.OrdinalIgnoreCase);
+        internal static readonly Dictionary<string, QChain> Chains = new Dictionary<string, QChain>(StringComparer.OrdinalIgnoreCase);
+        internal static float InteractRange = 4f;
+        internal static int MaxActive = 8;
+        internal static bool StrictPrefabs = true;
+        private static bool _prefabsChecked;
+        private static float _nextTick;
+        private static readonly Dictionary<string, string> SharedNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, float> HintAt = new Dictionary<string, float>();
+        private static bool _busy;
+
+        private static ManagerNPCRP.NpcDatabase Db { get { return ManagerNPCRP.Instance != null ? ManagerNPCRP.Instance.Database : null; } }
+
+        // ------------------------------------------------------------------ loading + schema validation
+        private static string S(JToken t, string k) { JToken v = t != null ? t[k] : null; return v == null || v.Type == JTokenType.Null ? "" : (string)v; }
+        private static int I(JToken t, string k, int def)
+        {
+            JToken v = t != null ? t[k] : null;
+            if (v == null || v.Type == JTokenType.Null) return def;
+            return (int)v;
+        }
+        private static float F(JToken t, string k, float def)
+        {
+            JToken v = t != null ? t[k] : null;
+            if (v == null || v.Type == JTokenType.Null) return def;
+            return (float)v;
+        }
+        private static List<string> L(JToken t, string k)
+        {
+            List<string> l = new List<string>();
+            JArray a = t != null ? t[k] as JArray : null;
+            if (a != null) foreach (JToken x in a) l.Add((string)x);
+            return l;
+        }
+
+        internal static void Load(ManagerNPCRP plugin)
+        {
+            Ordered.Clear(); Quests.Clear(); Chains.Clear(); _prefabsChecked = false; SharedNames.Clear();
+            try
+            {
+                ManagerNPCRP.NpcDatabase db = plugin.Database;
+                JToken ql;
+                if (db == null || db.extra == null || !db.extra.TryGetValue("questLines", out ql) || !(ql is JObject))
+                {
+                    plugin.Log.LogWarning("[QUEST] No 'questLines' section in the database: quest engine idle.");
+                    return;
+                }
+                if (I(ql, "schemaVersion", 0) != 1) plugin.Log.LogWarning("[QUEST] questLines.schemaVersion is not 1; trying anyway.");
+                JToken st = ql["settings"];
+                InteractRange = Mathf.Clamp(F(st, "interactRange", 4f), 1.5f, 8f);
+                MaxActive = Mathf.Clamp(I(st, "maxActive", 8), 1, 30);
+                StrictPrefabs = st == null || st["strictPrefabs"] == null || (bool)st["strictPrefabs"];
+
+                JObject chains = ql["chains"] as JObject;
+                if (chains != null)
+                    foreach (JProperty p in chains.Properties())
+                        Chains[p.Name] = new QChain { id = p.Name, title = S(p.Value, "title"), clan = S(p.Value, "clan"), faction = S(p.Value, "faction"), biome = S(p.Value, "biome") };
+
+                JArray arr = ql["quests"] as JArray;
+                if (arr == null) { plugin.Log.LogError("[QUEST] questLines.quests is missing or not an array."); return; }
+                int bad = 0;
+                foreach (JToken jq in arr)
+                {
+                    QDef q = null;
+                    try { q = Parse(jq); }
+                    catch (Exception ex) { plugin.Log.LogError("[QUEST] Unreadable quest definition (" + S(jq, "id") + "): " + ex.Message); bad++; continue; }
+                    if (Quests.ContainsKey(q.id)) { plugin.Log.LogError("[QUEST] Duplicate quest id '" + q.id + "': second definition ignored."); bad++; continue; }
+                    Quests[q.id] = q; Ordered.Add(q);
+                }
+                foreach (QDef q in Ordered)
+                {
+                    List<string> errs = Validate(plugin, q);
+                    if (errs.Count > 0)
+                    {
+                        q.disabled = string.Join(" ; ", errs.ToArray());
+                        plugin.Log.LogError("[QUEST] " + q.id + " DISABLED: " + q.disabled);
+                        bad++;
+                    }
+                }
+                foreach (QDef q in Ordered) if (q.disabled == null && HasCycle(q, new HashSet<string>())) { q.disabled = "prerequisite cycle"; plugin.Log.LogError("[QUEST] " + q.id + " DISABLED: prerequisite cycle"); bad++; }
+                Ordered.Sort((a, b) => a.chain != b.chain ? string.CompareOrdinal(a.chain, b.chain) : a.order.CompareTo(b.order));
+                plugin.Log.LogInfo("[QUEST] " + Ordered.Count + " quest(s) loaded, " + bad + " problem(s), chains: " + string.Join(", ", Chains.Keys.ToArray()));
+            }
+            catch (Exception ex) { plugin.Log.LogError("[QUEST] Load failed: " + ex); }
+        }
+
+        private static QDef Parse(JToken j)
+        {
+            QDef q = new QDef();
+            q.id = S(j, "id"); q.chain = S(j, "chain"); q.name = S(j, "name"); q.description = S(j, "description");
+            q.clan = S(j, "clan"); q.faction = S(j, "faction"); q.biome = S(j, "biome"); q.turnIn = S(j, "turnIn");
+            q.order = I(j, "order", 0); q.tier = I(j, "tier", 0);
+            q.givers = L(j, "givers");
+            JToken rq = j["requires"];
+            q.careers = L(rq, "careers"); q.prevQuests = L(rq, "quests"); q.flags = L(rq, "flags"); q.notFlags = L(rq, "notFlags");
+            q.minRepTier = I(rq, "minRepTier", 0);
+            q.next = L(j, "next");
+            JToken dl = j["dialogue"];
+            foreach (string k in new[] { "offer", "accepted", "active", "ready", "done" }) q.dlg[k] = S(dl, k);
+            JToken rw = j["rewards"];
+            q.repClanPoints = I(rw, "repClanPoints", 0);
+            q.rewardFlags = L(rw, "flags");
+            JArray items = rw != null ? rw["items"] as JArray : null;
+            if (items != null) foreach (JToken it in items) q.rewardItems.Add(new KeyValuePair<string, int>(S(it, "prefab"), I(it, "count", 1)));
+            JArray objs = j["objectives"] as JArray;
+            if (objs != null)
+                foreach (JToken o in objs)
+                {
+                    QObjective ob = new QObjective();
+                    ob.id = S(o, "id"); ob.type = S(o, "type").ToLowerInvariant(); ob.text = S(o, "text"); ob.npc = S(o, "npc");
+                    ob.item = S(o, "item"); ob.flag = S(o, "flag"); ob.quest = S(o, "quest"); ob.label = S(o, "label");
+                    ob.targets = L(o, "targets"); ob.count = I(o, "count", 1);
+                    ob.x = F(o, "x", 0f); ob.z = F(o, "z", 0f); ob.radius = F(o, "radius", 0f);
+                    q.objectives.Add(ob);
+                }
+            return q;
+        }
+
+        private static bool ValidId(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return false;
+            foreach (char c in s) if (!(char.IsLetterOrDigit(c) || c == '_' || c == '-')) return false;
+            return true;
+        }
+
+        private static List<string> Validate(ManagerNPCRP plugin, QDef q)
+        {
+            List<string> e = new List<string>();
+            ManagerNPCRP.NpcDatabase db = plugin.Database;
+            if (!ValidId(q.id)) e.Add("invalid id");
+            if (string.IsNullOrWhiteSpace(q.name)) e.Add("missing name");
+            if (!Chains.ContainsKey(q.chain ?? "")) e.Add("unknown chain '" + q.chain + "'");
+            if (!db.clans.ContainsKey(q.clan ?? "")) e.Add("unknown clan '" + q.clan + "'");
+            if (!db.factions.ContainsKey(q.faction ?? "")) e.Add("unknown faction '" + q.faction + "'");
+            if (q.givers.Count == 0) e.Add("no giver");
+            foreach (string g in q.givers) if (!plugin.Npcs.ContainsKey(g)) e.Add("giver '" + g + "' not in npcs");
+            if (!plugin.Npcs.ContainsKey(q.turnIn ?? "")) e.Add("turnIn '" + q.turnIn + "' not in npcs");
+            foreach (string c in q.careers) if (!db.careers.ContainsKey(c)) e.Add("unknown career '" + c + "'");
+            if (q.minRepTier < 0 || q.minRepTier > 3) e.Add("minRepTier must be 0..3");
+            if (q.objectives.Count == 0) e.Add("no objective");
+            HashSet<string> seen = new HashSet<string>();
+            foreach (QObjective o in q.objectives)
+            {
+                if (!ValidId(o.id) || !seen.Add(o.id)) e.Add("objective id '" + o.id + "' invalid or duplicated");
+                if (Array.IndexOf(ObjTypes, o.type) < 0) { e.Add("objective '" + o.id + "' unknown type '" + o.type + "'"); continue; }
+                switch (o.type)
+                {
+                    case "kill": if (o.targets.Count == 0 || o.count < 1) e.Add("kill '" + o.id + "' needs targets and count>=1"); break;
+                    case "collect":
+                    case "deliver": if (string.IsNullOrEmpty(o.item) || o.count < 1) e.Add(o.type + " '" + o.id + "' needs item and count>=1"); break;
+                    case "visit": if (o.radius <= 0f) e.Add("visit '" + o.id + "' needs radius>0"); break;
+                    case "talk": if (!plugin.Npcs.ContainsKey(o.npc ?? "")) e.Add("talk '" + o.id + "' unknown npc '" + o.npc + "'"); break;
+                    case "flag": if (string.IsNullOrEmpty(o.flag)) e.Add("flag '" + o.id + "' needs flag"); break;
+                    case "quest": if (string.IsNullOrEmpty(o.quest)) e.Add("quest '" + o.id + "' needs quest"); break;
+                }
+            }
+            foreach (string p in q.prevQuests) if (!Quests.ContainsKey(p)) e.Add("unknown prerequisite quest '" + p + "'");
+            foreach (string n in q.next) if (!Quests.ContainsKey(n)) e.Add("unknown next quest '" + n + "'");
+            foreach (KeyValuePair<string, int> it in q.rewardItems) if (string.IsNullOrEmpty(it.Key) || it.Value < 1) e.Add("invalid reward item");
+            if (q.repClanPoints > 0)
+            {
+                ReputationSettings r = db.reputation;
+                bool anyRow = false;
+                foreach (RepReward rw in r.rewards) if (string.Equals(rw.flag, RewardFlag(q, "renegat"), StringComparison.OrdinalIgnoreCase)) { anyRow = true; break; }
+                if (!anyRow) plugin.Log.LogWarning("[QUEST] " + q.id + ": repClanPoints=" + q.repClanPoints + " but no reputation.rewards row for flag '" + RewardFlag(q, "renegat") + "' (no reputation will be paid).");
+            }
+            return e;
+        }
+
+        private static bool HasCycle(QDef q, HashSet<string> path)
+        {
+            if (!path.Add(q.id)) return true;
+            foreach (string p in q.prevQuests) { QDef pq; if (Quests.TryGetValue(p, out pq) && HasCycle(pq, new HashSet<string>(path))) return true; }
+            return false;
+        }
+
+        internal static string RewardFlag(QDef q, string career) { return ("q_" + career + "_" + q.id).ToLowerInvariant(); }
+
+        // ------------------------------------------------------------------ runtime reference check (needs a loaded world)
+        internal static string CheckPrefabs(bool force)
+        {
+            if (!force && _prefabsChecked) return null;
+            if (ObjectDB.instance == null || ZNetScene.instance == null) return "world not ready";
+            _prefabsChecked = true;
+            int bad = 0, ok = 0;
+            foreach (QDef q in Ordered)
+            {
+                if (q.disabled != null && !q.disabled.StartsWith("prefab:")) continue;
+                List<string> miss = new List<string>();
+                foreach (QObjective o in q.objectives)
+                {
+                    if (o.type == "kill") foreach (string t in o.targets) if (ZNetScene.instance.GetPrefab(t) == null) miss.Add("creature " + t);
+                    if ((o.type == "collect" || o.type == "deliver") && ObjectDB.instance.GetItemPrefab(o.item) == null) miss.Add("item " + o.item);
+                }
+                foreach (KeyValuePair<string, int> it in q.rewardItems)
+                    if (ObjectDB.instance.GetItemPrefab(it.Key) == null) ManagerNPCRP.Instance.Log.LogWarning("[QUEST] " + q.id + ": reward item '" + it.Key + "' unknown (reward skipped).");
+                if (miss.Count > 0)
+                {
+                    bad++;
+                    string why = "prefab: " + string.Join(", ", miss.ToArray()) + " not found in this game version - fix the name in npc_database.json";
+                    ManagerNPCRP.Instance.Log.LogError("[QUEST] " + q.id + " " + (StrictPrefabs ? "DISABLED" : "WARNING") + " " + why);
+                    if (StrictPrefabs) q.disabled = why;
+                    else q.disabled = null;
+                }
+                else { ok++; if (q.disabled != null) q.disabled = null; }
+            }
+            string res = "prefab check: " + ok + " quest(s) OK, " + bad + " with unknown references";
+            ManagerNPCRP.Instance.Log.LogInfo("[QUEST] " + res);
+            return res;
+        }
+
+        // ------------------------------------------------------------------ per-player state
+        private static string Raw(Player p, string id) { string v; return p != null && p.m_customData.TryGetValue(StatePrefix + id, out v) ? v : ""; }
+        internal static bool IsCompleted(Player p, string id) { return Raw(p, id) == "C"; }
+        internal static bool IsActive(Player p, string id) { return Raw(p, id).StartsWith("A;", StringComparison.Ordinal); }
+
+        private static Dictionary<string, int> Prog(Player p, string id)
+        {
+            Dictionary<string, int> d = new Dictionary<string, int>();
+            string raw = Raw(p, id);
+            if (!raw.StartsWith("A;", StringComparison.Ordinal)) return d;
+            foreach (string part in raw.Substring(2).Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                int eq = part.IndexOf('='); int n;
+                if (eq > 0 && int.TryParse(part.Substring(eq + 1), out n)) d[part.Substring(0, eq)] = n;
+            }
+            return d;
+        }
+        private static void SaveProg(Player p, string id, Dictionary<string, int> d)
+        {
+            List<string> parts = new List<string>();
+            foreach (KeyValuePair<string, int> kv in d) parts.Add(kv.Key + "=" + kv.Value);
+            p.m_customData[StatePrefix + id] = "A;" + string.Join(",", parts.ToArray());
+        }
+
+        internal static string SharedName(string prefab)
+        {
+            string s;
+            if (SharedNames.TryGetValue(prefab, out s)) return s;
+            if (ObjectDB.instance == null) return null;
+            GameObject go = ObjectDB.instance.GetItemPrefab(prefab);
+            ItemDrop drop = go != null ? go.GetComponent<ItemDrop>() : null;
+            if (drop == null || drop.m_itemData == null || drop.m_itemData.m_shared == null) return null;
+            SharedNames[prefab] = drop.m_itemData.m_shared.m_name;
+            return drop.m_itemData.m_shared.m_name;
+        }
+        private static int CountItem(Player p, string prefab)
+        {
+            string shared = SharedName(prefab);
+            return shared == null || p.GetInventory() == null ? 0 : p.GetInventory().CountItems(shared);
+        }
+
+        internal static void ObjStatus(Player p, QDef q, QObjective o, Dictionary<string, int> prog, out int have, out int need)
+        {
+            need = 1; have = 0;
+            switch (o.type)
+            {
+                case "kill": need = o.count; prog.TryGetValue(o.id, out have); break;
+                case "collect":
+                case "deliver": need = o.count; have = CountItem(p, o.item); break;
+                case "visit":
+                case "talk": { int v; prog.TryGetValue(o.id, out v); have = v > 0 ? 1 : 0; break; }
+                case "flag": have = DialogueStages.FlagOn(o.flag) ? 1 : 0; break;
+                case "quest": have = IsCompleted(p, o.quest) ? 1 : 0; break;
+            }
+            if (have > need) have = need;
+        }
+        private static bool AllDone(Player p, QDef q, Dictionary<string, int> prog)
+        {
+            foreach (QObjective o in q.objectives) { int h, n; ObjStatus(p, q, o, prog, out h, out n); if (h < n) return false; }
+            return true;
+        }
+
+        /// <summary>Access rules, each one independent: career list, prerequisite quests, story flags, then the reputation of the quest's clan/faction.</summary>
+        internal static QuestState Evaluate(Player p, QDef q, out string reason)
+        {
+            reason = "";
+            if (q.disabled != null) { reason = q.disabled; return QuestState.Locked; }
+            string raw = Raw(p, q.id);
+            if (raw == "C") return QuestState.Completed;
+            if (raw.StartsWith("A;", StringComparison.Ordinal)) return AllDone(p, q, Prog(p, q.id)) ? QuestState.Ready : QuestState.Active;
+            string career = ReputationManager.LocalCareer();
+            if (q.careers.Count > 0 && !q.careers.Any(c => string.Equals(c, career, StringComparison.OrdinalIgnoreCase)))
+            { reason = "réservée à d'autres carrières"; return QuestState.Locked; }
+            foreach (string pq in q.prevQuests)
+                if (!IsCompleted(p, pq)) { QDef d; reason = "terminer d'abord : " + (Quests.TryGetValue(pq, out d) ? d.name : pq); return QuestState.Locked; }
+            foreach (string f in q.flags) if (!DialogueStages.FlagOn(f)) { reason = "événement requis : " + f; return QuestState.Locked; }
+            foreach (string f in q.notFlags) if (DialogueStages.FlagOn(f)) { reason = "plus disponible (" + f + ")"; return QuestState.Locked; }
+            if (QuestTier(q) < q.minRepTier)
+            { reason = "réputation « " + TierName(q.minRepTier) + " » requise auprès de " + q.clan; return QuestState.Locked; }
+            return QuestState.Available;
+        }
+        /// <summary>Same rule as ReputationManager.TierFor for a city clan: best of the clan tier and (faction tier - 1).</summary>
+        internal static int QuestTier(QDef q)
+        {
+            return Mathf.Max(ReputationManager.TierFromFlags(q.clan), Mathf.Max(0, ReputationManager.FactionTierFromFlags(q.faction) - 1));
+        }
+        internal static string TierName(int t)
+        {
+            ReputationSettings r = Db != null ? Db.reputation : null;
+            return r != null && r.tierNames.Count > 0 ? r.tierNames[Mathf.Min(t, r.tierNames.Count - 1)] : t.ToString();
+        }
+        internal static string NpcName(string id)
+        {
+            ManagerNPCRP.NpcDefinition n;
+            return ManagerNPCRP.Instance != null && ManagerNPCRP.Instance.Npcs.TryGetValue(id, out n) ? n.identity.name : id;
+        }
+        internal static string Line(QDef q, QuestState s)
+        {
+            string k = s == QuestState.Available ? "offer" : s == QuestState.Active ? "active" : s == QuestState.Ready ? "ready" : "done";
+            string v; return q.dlg.TryGetValue(k, out v) ? v : "";
+        }
+
+        // ------------------------------------------------------------------ player actions
+        internal static string Accept(Player p, QDef q, string npcId)
+        {
+            if (_busy) return "";
+            string why; QuestState st = Evaluate(p, q, out why);
+            if (st != QuestState.Available) return st == QuestState.Locked ? "Quête verrouillée : " + why : "Quête déjà " + (st == QuestState.Completed ? "terminée." : "en cours.");
+            if (!q.givers.Contains(npcId)) return "Ce n'est pas le bon interlocuteur : " + string.Join(" ou ", q.givers.Select(g => NpcName(g)).ToArray()) + ".";
+            int active = Ordered.Count(x => IsActive(p, x.id));
+            if (active >= MaxActive) return "Trop de quêtes actives (" + MaxActive + " maximum).";
+            Dictionary<string, int> prog = new Dictionary<string, int>();
+            foreach (QObjective o in q.objectives) if (o.type == "kill" || o.type == "visit" || o.type == "talk") prog[o.id] = 0;
+            SaveProg(p, q.id, prog);
+            LogDbg("accepted " + q.id);
+            return "";
+        }
+
+        internal static string Abandon(Player p, QDef q)
+        {
+            if (!IsActive(p, q.id)) return "Cette quête n'est pas active.";
+            p.m_customData.Remove(StatePrefix + q.id);
+            LogDbg("abandoned " + q.id);
+            return "";
+        }
+
+        /// <summary>All-or-nothing: verify every objective, verify items, remove items, only then mark completed and pay.</summary>
+        internal static string TurnIn(Player p, QDef q, string npcId, out string doneLine)
+        {
+            doneLine = "";
+            if (_busy) return "";
+            _busy = true;
+            try
+            {
+                string why; QuestState st = Evaluate(p, q, out why);
+                if (st == QuestState.Completed) return "Déjà rendue.";
+                if (st != QuestState.Ready) return "Les objectifs ne sont pas tous accomplis.";
+                if (!string.Equals(q.turnIn, npcId, StringComparison.OrdinalIgnoreCase)) return "À rendre auprès de " + NpcName(q.turnIn) + ".";
+                // aggregate required items per prefab (two objectives may need the same item)
+                Dictionary<string, int> need = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                foreach (QObjective o in q.objectives)
+                    if (o.type == "deliver") { int n; need.TryGetValue(o.item, out n); need[o.item] = n + o.count; }
+                foreach (KeyValuePair<string, int> kv in need)
+                    if (CountItem(p, kv.Key) < kv.Value) return "Il vous manque des objets : " + kv.Value + " × " + kv.Key + ".";
+                List<KeyValuePair<string, int>> removed = new List<KeyValuePair<string, int>>();
+                foreach (KeyValuePair<string, int> kv in need)
+                {
+                    if (RemoveItems(p, kv.Key, kv.Value)) removed.Add(kv);
+                    else
+                    {
+                        foreach (KeyValuePair<string, int> r in removed) GiveItem(p, r.Key, r.Value);   // rollback
+                        ManagerNPCRP.Instance.Log.LogError("[QUEST] " + q.id + ": item removal failed for " + kv.Key + ", turn-in cancelled and items restored.");
+                        return "Remise impossible pour le moment (objets restitués).";
+                    }
+                }
+                // state first: a reload after this point can never pay twice
+                p.m_customData[StatePrefix + q.id] = "C";
+                string career = ReputationManager.LocalCareer();
+                foreach (string f in q.rewardFlags) SetFlag(f);
+                SetFlag(RewardFlag(q, career));
+                foreach (KeyValuePair<string, int> it in q.rewardItems) GiveItem(p, it.Key, it.Value);
+                doneLine = Line(q, QuestState.Completed);
+                p.Message(MessageHud.MessageType.Center, "Quête terminée : " + q.name);
+                p.Message(MessageHud.MessageType.TopLeft, "Journal mis à jour : " + q.name);
+                foreach (string n in q.next)
+                {
+                    QDef nq; string r2;
+                    if (Quests.TryGetValue(n, out nq) && Evaluate(p, nq, out r2) == QuestState.Available)
+                        p.Message(MessageHud.MessageType.TopLeft, "Nouvelle quête disponible : " + nq.name + " (" + NpcName(nq.givers[0]) + ")");
+                }
+                LogDbg("completed " + q.id + " career=" + career);
+                return "";
+            }
+            finally { _busy = false; }
+        }
+
+        private static void SetFlag(string flag)
+        {
+            if (string.IsNullOrEmpty(flag) || ZoneSystem.instance == null) return;
+            if (!DialogueStages.RawOn(flag)) ZoneSystem.instance.SetGlobalKey("rp_" + flag);
+        }
+
+        // reflection keeps the mod compiling across Valheim versions that changed these signatures
+        private static object[] FillArgs(ParameterInfo[] ps, params object[] first)
+        {
+            object[] a = new object[ps.Length];
+            for (int i = 0; i < ps.Length; i++)
+            {
+                if (i < first.Length) a[i] = first[i];
+                else if (ps[i].HasDefaultValue && ps[i].DefaultValue != null && ps[i].DefaultValue != DBNull.Value) a[i] = ps[i].DefaultValue;
+                else if (ps[i].ParameterType == typeof(int)) a[i] = (ps[i].Name ?? "").ToLowerInvariant().Contains("quality") ? 1 : 0;
+                else if (ps[i].ParameterType == typeof(bool)) a[i] = false;
+                else if (ps[i].ParameterType == typeof(long)) a[i] = 0L;
+                else if (ps[i].ParameterType == typeof(string)) a[i] = "";
+                else a[i] = null;
+            }
+            return a;
+        }
+        private static bool RemoveItems(Player p, string prefab, int amount)
+        {
+            string shared = SharedName(prefab);
+            Inventory inv = p.GetInventory();
+            if (shared == null || inv == null) return false;
+            foreach (MethodInfo m in typeof(Inventory).GetMethods(BindingFlags.Instance | BindingFlags.Public))
+            {
+                ParameterInfo[] ps = m.GetParameters();
+                if (m.Name != "RemoveItem" || ps.Length < 2 || ps[0].ParameterType != typeof(string) || ps[1].ParameterType != typeof(int)) continue;
+                int before = inv.CountItems(shared);
+                try { m.Invoke(inv, FillArgs(ps, shared, amount)); } catch (Exception ex) { ManagerNPCRP.Instance.Log.LogWarning("[QUEST] RemoveItem failed: " + ex.Message); return false; }
+                return before - inv.CountItems(shared) >= amount;
+            }
+            ManagerNPCRP.Instance.Log.LogError("[QUEST] Inventory.RemoveItem(string,int,...) not found: delivery objectives cannot be consumed.");
+            return false;
+        }
+        private static void GiveItem(Player p, string prefab, int count)
+        {
+            try
+            {
+                GameObject go = ObjectDB.instance != null ? ObjectDB.instance.GetItemPrefab(prefab) : null;
+                if (go == null) { ManagerNPCRP.Instance.Log.LogWarning("[QUEST] reward item '" + prefab + "' unknown: skipped."); return; }
+                Inventory inv = p.GetInventory();
+                foreach (MethodInfo m in typeof(Inventory).GetMethods(BindingFlags.Instance | BindingFlags.Public))
+                {
+                    ParameterInfo[] ps = m.GetParameters();
+                    if (m.Name != "AddItem" || ps.Length < 2 || ps[0].ParameterType != typeof(string) || ps[1].ParameterType != typeof(int)) continue;
+                    object r = m.Invoke(inv, FillArgs(ps, prefab, count));
+                    if (r != null) { p.Message(MessageHud.MessageType.TopLeft, "+ " + count + " × " + prefab); return; }
+                    break;
+                }
+                // inventory full or API mismatch: drop at the player's feet instead of losing the reward
+                GameObject drop = UnityEngine.Object.Instantiate(go, p.transform.position + p.transform.forward * 1.2f + Vector3.up * 1.5f, Quaternion.identity);
+                ItemDrop idr = drop.GetComponent<ItemDrop>();
+                if (idr != null && idr.m_itemData != null) idr.m_itemData.m_stack = count;
+                p.Message(MessageHud.MessageType.TopLeft, "Inventaire plein : " + count + " × " + prefab + " déposé à vos pieds.");
+            }
+            catch (Exception ex) { ManagerNPCRP.Instance.Log.LogWarning("[QUEST] GiveItem failed: " + ex.Message); }
+        }
+
+        // ------------------------------------------------------------------ objective tracking
+        private static string PrefabName(GameObject go)
+        {
+            string n = go.name; int i = n.IndexOf("(Clone)", StringComparison.Ordinal);
+            return i >= 0 ? n.Substring(0, i).Trim() : n;
+        }
+
+        /// <summary>Runs on whichever client owns the dying creature. Only the LAST attacker (a Player) is credited, never the owner by default.</summary>
+        internal static void OnDeathPostfix(Character __instance)
+        {
+            try
+            {
+                if (__instance == null || Ordered.Count == 0 || __instance is Player || __instance is Viking) return;
+                ZNetView nv = __instance.GetComponent<ZNetView>();
+                if (nv == null || !nv.IsValid() || !nv.IsOwner()) return;
+                if (nv.GetZDO().GetString(RpIdKey, "").Length > 0) return;      // RP NPC (ally or not): never a hunt target
+                if (__instance.IsTamed()) return;
+                HitData hit = LastHit != null ? LastHit.GetValue(__instance) as HitData : null;
+                Player killer = hit != null ? hit.GetAttacker() as Player : null;
+                if (killer == null) return;
+                string prefab = PrefabName(__instance.gameObject);
+                if (killer == Player.m_localPlayer) CreditKill(prefab);
+                else if (ZRoutedRpc.instance != null)
+                    ZRoutedRpc.instance.InvokeRoutedRPC(ZRoutedRpc.Everybody, "RP_QKill", killer.GetPlayerID(), prefab);
+            }
+            catch (Exception ex) { ManagerNPCRP.Instance?.Log.LogWarning("[QUEST] kill hook failed: " + ex.Message); }
+        }
+        private static void RpcKill(long sender, long playerId, string prefab)
+        {
+            Player lp = Player.m_localPlayer;
+            if (lp != null && lp.GetPlayerID() == playerId) CreditKill(prefab);   // every other client ignores it
+        }
+        internal static void GameStartPostfix()
+        {
+            if (ZRoutedRpc.instance != null) ZRoutedRpc.instance.Register<long, string>("RP_QKill", RpcKill);
+        }
+
+        private static void CreditKill(string prefab)
+        {
+            Player lp = Player.m_localPlayer;
+            if (lp == null) return;
+            foreach (QDef q in Ordered)
+            {
+                if (q.disabled != null || !IsActive(lp, q.id)) continue;
+                Dictionary<string, int> prog = Prog(lp, q.id);
+                bool changed = false;
+                foreach (QObjective o in q.objectives)
+                {
+                    if (o.type != "kill" || !o.targets.Any(t => string.Equals(t, prefab, StringComparison.OrdinalIgnoreCase))) continue;
+                    int have; prog.TryGetValue(o.id, out have);
+                    if (have >= o.count) continue;
+                    prog[o.id] = have + 1; changed = true;
+                    lp.Message(MessageHud.MessageType.TopLeft, q.name + " : " + o.text + " (" + (have + 1) + "/" + o.count + ")");
+                }
+                if (changed) { SaveProg(lp, q.id, prog); AnnounceIfReady(lp, q); }
+            }
+        }
+        private static void AnnounceIfReady(Player lp, QDef q)
+        {
+            if (AllDone(lp, q, Prog(lp, q.id)))
+                lp.Message(MessageHud.MessageType.Center, "Objectifs accomplis : " + q.name + " — à rendre à " + NpcName(q.turnIn) + " (O)");
+        }
+
+        /// <summary>Called by the T and O interactions with a given NPC.</summary>
+        internal static void OnTalk(string npcId)
+        {
+            Player lp = Player.m_localPlayer;
+            if (lp == null) return;
+            foreach (QDef q in Ordered)
+            {
+                if (q.disabled != null || !IsActive(lp, q.id)) continue;
+                Dictionary<string, int> prog = Prog(lp, q.id);
+                bool changed = false;
+                foreach (QObjective o in q.objectives)
+                {
+                    int have; prog.TryGetValue(o.id, out have);
+                    if (o.type != "talk" || have > 0 || !string.Equals(o.npc, npcId, StringComparison.OrdinalIgnoreCase)) continue;
+                    prog[o.id] = 1; changed = true;
+                    lp.Message(MessageHud.MessageType.TopLeft, q.name + " : " + o.text + " (fait)");
+                }
+                if (changed) { SaveProg(lp, q.id, prog); AnnounceIfReady(lp, q); }
+            }
+        }
+
+        private static void TickVisits()
+        {
+            Player lp = Player.m_localPlayer;
+            if (lp == null || Time.time < _nextTick) return;
+            _nextTick = Time.time + 0.5f;
+            if (!_prefabsChecked) CheckPrefabs(false);
+            Vector3 pos = lp.transform.position;
+            foreach (QDef q in Ordered)
+            {
+                if (q.disabled != null || !IsActive(lp, q.id)) continue;
+                Dictionary<string, int> prog = null; bool changed = false;
+                foreach (QObjective o in q.objectives)
+                {
+                    if (o.type != "visit") continue;
+                    if (prog == null) prog = Prog(lp, q.id);
+                    int have; prog.TryGetValue(o.id, out have);
+                    if (have > 0) continue;
+                    float dx = pos.x - o.x, dz = pos.z - o.z;
+                    if (dx * dx + dz * dz > o.radius * o.radius) continue;
+                    prog[o.id] = 1; changed = true;
+                    lp.Message(MessageHud.MessageType.TopLeft, q.name + " : " + o.text + " (fait)");
+                }
+                if (changed) { SaveProg(lp, q.id, prog); AnnounceIfReady(lp, q); }
+            }
+        }
+
+        // ------------------------------------------------------------------ NPC lookup + T/O entry points
+        internal static bool FindNearest(float range, out Viking best, out string bestId)
+        {
+            best = null; bestId = null;
+            Player lp = Player.m_localPlayer; ManagerNPCRP plugin = ManagerNPCRP.Instance;
+            if (lp == null || plugin == null) return false;
+            float bestD = range;
+            foreach (Character c in Character.GetAllCharacters())
+            {
+                Viking v = c as Viking;
+                if (v == null || v.IsDead()) continue;
+                float d = Vector3.Distance(v.transform.position, lp.transform.position);
+                if (d >= bestD) continue;
+                string id = ReputationManager.IdOf(v);
+                if (id.Length == 0 || !plugin.Npcs.ContainsKey(id)) continue;
+                best = v; bestId = id; bestD = d;
+            }
+            return best != null;
+        }
+
+        private static bool GameUiOpen()
+        {
+            if (NpcTalk.UiBlocked()) return true;
+            try
+            {
+                MethodInfo vis = typeof(InventoryGui).GetMethod("IsVisible", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                if (vis != null && (bool)vis.Invoke(null, null)) return true;
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>Hint shown after a T conversation; never replaces the NPC's own line.</summary>
+        internal static void AfterTalk(string npcId)
+        {
+            Player lp = Player.m_localPlayer;
+            if (lp == null || Ordered.Count == 0) return;
+            OnTalk(npcId);
+            float last;
+            if (HintAt.TryGetValue(npcId, out last) && Time.time - last < 15f) return;
+            int avail = 0, ready = 0;
+            foreach (QDef q in Ordered)
+            {
+                string r; QuestState s = Evaluate(lp, q, out r);
+                if (s == QuestState.Available && q.givers.Contains(npcId)) avail++;
+                if (s == QuestState.Ready && q.turnIn == npcId) ready++;
+            }
+            if (avail + ready == 0) return;
+            HintAt[npcId] = Time.time;
+            lp.Message(MessageHud.MessageType.TopLeft, "[O] Quêtes : " + avail + " disponible(s), " + ready + " à rendre");
+        }
+
+        internal static void Update(bool talkedThisFrame)
+        {
+            if (Ordered.Count == 0) return;
+            TickVisits();
+            QuestUi.Maintain();
+            ManagerNPCRP plugin = ManagerNPCRP.Instance;
+            if (Input.GetKeyDown(KeyCode.Escape) && QuestUi.IsOpen) { QuestUi.Close(); return; }
+            if (talkedThisFrame || plugin == null || !Input.GetKeyDown(plugin.QuestKeyValue)) return;
+            if (QuestUi.IsOpen) { QuestUi.Close(); return; }
+            Player lp = Player.m_localPlayer;
+            if (lp == null || GameUiOpen()) return;
+            Viking v; string id;
+            if (!FindNearest(InteractRange, out v, out id)) { QuestUi.Open(null, null); return; }   // no NPC close enough: journal only
+            ManagerNPCRP.NpcDefinition npc = plugin.Npcs[id];
+            if (ReputationManager.IsRefusing(id, npc.clan)) { NpcTalk.Say(v, ReputationManager.Pick(ReputationManager.RefusalLines(id, npc.clan)), true); return; }
+            OnTalk(id);
+            QuestUi.Open(v, id);
+        }
+
+        // ------------------------------------------------------------------ journal + commands
+        internal static void AppendJournal(List<string> lines)
+        {
+            Player lp = Player.m_localPlayer;
+            if (lp == null || Ordered.Count == 0) return;
+            List<string> act = new List<string>(), done = new List<string>(), avail = new List<string>();
+            foreach (QDef q in Ordered)
+            {
+                string r; QuestState s = Evaluate(lp, q, out r);
+                if (s == QuestState.Active || s == QuestState.Ready)
+                {
+                    act.Add("  " + (s == QuestState.Ready ? "[À RENDRE à " + NpcName(q.turnIn) + "] " : "") + q.name + " (" + q.id + ")");
+                    Dictionary<string, int> prog = Prog(lp, q.id);
+                    foreach (QObjective o in q.objectives) { int h, n; ObjStatus(lp, q, o, prog, out h, out n); act.Add("      " + (h >= n ? "[x] " : "[ ] ") + o.text + (n > 1 ? " (" + h + "/" + n + ")" : "")); }
+                }
+                else if (s == QuestState.Completed) done.Add("  " + q.name + " (" + q.id + ")");
+                else if (s == QuestState.Available) avail.Add("  " + q.name + " — " + NpcName(q.givers[0]) + " (" + q.clan + ")");
+            }
+            lines.Add("Quêtes actives :"); if (act.Count == 0) lines.Add("  aucune"); lines.AddRange(act);
+            lines.Add("Quêtes disponibles :"); if (avail.Count == 0) lines.Add("  aucune"); lines.AddRange(avail);
+            lines.Add("Quêtes terminées (" + done.Count + ") :"); lines.AddRange(done);
+            List<string> fl = new List<string>();
+            foreach (QDef q in Ordered) if (IsCompleted(lp, q.id)) foreach (string f in q.rewardFlags) fl.Add(f);
+            if (fl.Count > 0) lines.Add("Événements débloqués : " + string.Join(", ", fl.ToArray()));
+        }
+
+        internal static void RegisterCommands()
+        {
+            new NorseCommand("rp_quests", "List your quests (active, available, completed).",
+                args => { List<string> l = new List<string>(); AppendJournal(l); foreach (string s in l) { if (Console.instance != null) Console.instance.Print(s); else ManagerNPCRP.Instance.Log.LogInfo(s); } return true; },
+                adminOnly: false);
+            new NorseCommand("rp_quest_check", "Validate quest definitions against the loaded game (prefabs, items).",
+                args => { string r = CheckPrefabs(true); if (Console.instance != null) Console.instance.Print("[QUEST] " + r); return true; },
+                adminOnly: true);
+            new NorseCommand("rp_quest", "Quest admin: rp_quest reset <QuestId|all> | rp_quest state <QuestId>",
+                args =>
+                {
+                    string[] a = ManagerNPCRP.CmdArgs(args.Args, "rp_quest");
+                    Player lp = Player.m_localPlayer; if (lp == null || a.Length < 3) { ManagerNPCRP.Instance.Log.LogInfo("Usage: rp_quest reset <id|all> | rp_quest state <id>"); return true; }
+                    if (a[1] == "reset")
+                    {
+                        foreach (QDef q in Ordered) if (a[2] == "all" || string.Equals(a[2], q.id, StringComparison.OrdinalIgnoreCase)) lp.m_customData.Remove(StatePrefix + q.id);
+                        lp.Message(MessageHud.MessageType.TopLeft, "Quest state reset: " + a[2]);
+                    }
+                    else if (a[1] == "state") { string r; QDef q; if (Quests.TryGetValue(a[2], out q)) lp.Message(MessageHud.MessageType.TopLeft, q.id + " = " + Evaluate(lp, q, out r) + " " + r + " raw=" + Raw(lp, q.id)); }
+                    return true;
+                }, adminOnly: true);
+        }
+        private static void LogDbg(string m)
+        {
+            if (Db != null && Db.settings != null && Db.settings.debug) ManagerNPCRP.Instance.Log.LogInfo("[QUEST] " + m);
+        }
+    }
+
+    // =====================================================================
+    // QUEST UI  (IMGUI window: the mod has no uGUI asset bundle, IMGUI is the compatible option)
+    // =====================================================================
+    internal static class QuestUi
+    {
+        private static bool _open;
+        private static Viking _viking;
+        private static string _npcId;
+        private static int _tab;                 // 0 = this NPC, 1 = journal
+        private static string _sel;
+        private static string _confirmAbandon;
+        private static string _msg = "";
+        private static Vector2 _scrollL, _scrollR;
+        private static Rect _rect = new Rect(0, 0, 820, 540);
+        private static bool _placed;
+        internal static bool IsOpen { get { return _open; } }
+        internal static void PlayerUpdatePrefix()
+        {
+            if (!_open)
+                return;
+
+            // Clear Unity input state immediately before Player.Update reads it.
+            Input.ResetInputAxes();
+
+            // Extra safety: force the cursor/UI state expected by the quest window.
+            Cursor.lockState = CursorLockMode.None;
+            Cursor.visible = true;
+        }
+        internal static void Open(Viking v, string npcId)
+        {
+            _viking = v; _npcId = npcId; _tab = npcId != null ? 0 : 1; _sel = null; _msg = ""; _confirmAbandon = null; _open = true;
+            _rect.x = (Screen.width - _rect.width) / 2f; _rect.y = (Screen.height - _rect.height) / 2f; _placed = true;
+            Cursor.lockState = CursorLockMode.None; Cursor.visible = true;
+            if (v != null) SpeakState();
+        }
+        internal static void Close()
+        {
+            if (!_open) return;
+            _open = false; _viking = null; _npcId = null;
+            Cursor.lockState = CursorLockMode.Locked; Cursor.visible = false;
+        }
+        /// <summary>Drops stale interactions: NPC dead, destroyed, or the player walked away.</summary>
+        internal static void Maintain()
+        {
+            if (!_open || _npcId == null) return;
+            Player lp = Player.m_localPlayer;
+            if (lp == null) { Close(); return; }
+            bool gone = _viking == null || _viking.IsDead() ||
+                        Vector3.Distance(_viking.transform.position, lp.transform.position) > QuestEngine.InteractRange + 2f;
+            if (gone) { _npcId = null; _viking = null; _tab = 1; _sel = null; _msg = "Vous vous êtes éloigné : seul le journal est consultable."; }
+        }
+        private static void SpeakState()
+        {
+            Player lp = Player.m_localPlayer; string r;
+            QDef pick = null; QuestState ps = QuestState.Locked;
+            foreach (QDef q in QuestEngine.Ordered)
+            {
+                QuestState s = QuestEngine.Evaluate(lp, q, out r);
+                if (s == QuestState.Ready && q.turnIn == _npcId) { pick = q; ps = s; break; }
+                if (s == QuestState.Available && q.givers.Contains(_npcId) && (pick == null || ps != QuestState.Active)) { pick = q; ps = s; }
+                if (s == QuestState.Active && (q.givers.Contains(_npcId) || q.turnIn == _npcId) && pick == null) { pick = q; ps = s; }
+            }
+            if (pick != null) NpcTalk.Say(_viking, QuestEngine.Line(pick, ps), true);
+        }
+
+        internal static void OnGui()
+        {
+            if (!_open || !_placed) return;
+            GUI.depth = -1000;
+            _rect = GUI.Window(0x5251, _rect, DrawWindow, "Quêtes — " + (_npcId != null ? QuestEngine.NpcName(_npcId) : "Journal"));
+        }
+
+        private static void DrawWindow(int id)
+        {
+            Player lp = Player.m_localPlayer;
+            if (lp == null) { Close(); return; }
+            GUILayout.BeginHorizontal();
+            if (_npcId != null && GUILayout.Toggle(_tab == 0, " Ce PNJ ", GUI.skin.button)) _tab = 0;
+            if (GUILayout.Toggle(_tab == 1, " Journal ", GUI.skin.button)) _tab = 1;
+            GUILayout.FlexibleSpace();
+            if (GUILayout.Button(" Fermer (O) ")) { Close(); return; }
+            GUILayout.EndHorizontal();
+            if (_msg.Length > 0) GUILayout.Label("<color=#ffd27f>" + _msg + "</color>");
+            GUILayout.BeginHorizontal();
+            // ---- left: quest list
+            GUILayout.BeginVertical(GUILayout.Width(300));
+            _scrollL = GUILayout.BeginScrollView(_scrollL, GUILayout.Height(430));
+            foreach (QDef q in QuestEngine.Ordered)
+            {
+                string reason; QuestState s = QuestEngine.Evaluate(lp, q, out reason);
+                bool mine = _npcId != null && (q.givers.Contains(_npcId) || q.turnIn == _npcId);
+                bool show = _tab == 0 ? mine && Visible(lp, q, s) : (s == QuestState.Active || s == QuestState.Ready || s == QuestState.Completed || s == QuestState.Available);
+                if (!show) continue;
+                string tag = s == QuestState.Ready ? "[À RENDRE] " : s == QuestState.Active ? "[En cours] " : s == QuestState.Completed ? "[Terminée] " : s == QuestState.Available ? "[Disponible] " : "[Verrouillée] ";
+                if (GUILayout.Toggle(_sel == q.id, tag + q.name, GUI.skin.button)) { if (_sel != q.id) { _sel = q.id; _confirmAbandon = null; _msg = ""; } }
+            }
+            GUILayout.EndScrollView();
+            GUILayout.EndVertical();
+            // ---- right: detail
+            GUILayout.BeginVertical();
+            _scrollR = GUILayout.BeginScrollView(_scrollR, GUILayout.Height(430));
+            QDef sel; if (_sel != null && QuestEngine.Quests.TryGetValue(_sel, out sel)) DrawDetail(lp, sel); else GUILayout.Label("Sélectionnez une quête.");
+            GUILayout.EndScrollView();
+            GUILayout.EndVertical();
+            GUILayout.EndHorizontal();
+            Event current = Event.current;
+            if (current.type == EventType.MouseDown ||
+                current.type == EventType.MouseUp ||
+                current.type == EventType.ScrollWheel)
+            {
+                current.Use();
+            }
+
+            GUI.DragWindow(new Rect(0, 0, 10000, 22));
+        }
+
+        /// <summary>Hide locked quests that only wait for an earlier quest of the chain (no spoilers); show the others with their reason.</summary>
+        private static bool Visible(Player lp, QDef q, QuestState s)
+        {
+            if (s != QuestState.Locked) return true;
+            foreach (string p in q.prevQuests) if (!QuestEngine.IsCompleted(lp, p)) return false;
+            return true;
+        }
+
+        private static void DrawDetail(Player lp, QDef q)
+        {
+            string reason; QuestState s = QuestEngine.Evaluate(lp, q, out reason);
+            QChain ch; QuestEngine.Chains.TryGetValue(q.chain, out ch);
+            GUILayout.Label("<b>" + q.name + "</b>");
+            GUILayout.Label((ch != null ? ch.title + " — " : "") + q.clan + " (" + q.faction + ") — " + q.biome + " — palier " + q.tier);
+            GUILayout.Label(q.description);
+            string line = QuestEngine.Line(q, s);
+            if (line.Length > 0) GUILayout.Label("<i>« " + line + " »</i>");
+            GUILayout.Space(6);
+            GUILayout.Label("<b>Objectifs</b>");
+            foreach (QObjective o in q.objectives)
+            {
+                int h = 0, n = 1;
+                if (s == QuestState.Active || s == QuestState.Ready || s == QuestState.Completed)
+                {
+                    if (s == QuestState.Completed) { h = 1; n = 1; }
+                    else QuestEngine.ObjStatus(lp, q, o, ProgOf(lp, q), out h, out n);
+                }
+                GUILayout.Label((h >= n ? "[x] " : "[ ] ") + o.text + (n > 1 && s != QuestState.Completed ? " (" + h + "/" + n + ")" : "") +
+                                (o.type == "deliver" ? "  — à remettre" : ""));
+            }
+            GUILayout.Space(6);
+            GUILayout.Label("Donneur : " + string.Join(" / ", q.givers.Select(g => QuestEngine.NpcName(g)).ToArray()) + "   —   Remise : " + QuestEngine.NpcName(q.turnIn));
+            string rw = (q.repClanPoints > 0 ? "réputation " + q.clan + " +" + q.repClanPoints : "");
+            foreach (KeyValuePair<string, int> it in q.rewardItems) rw += (rw.Length > 0 ? ", " : "") + it.Value + " × " + it.Key;
+            GUILayout.Label("Récompenses : " + (rw.Length > 0 ? rw : "—"));
+            if (s == QuestState.Locked) GUILayout.Label("<color=#ff9f7f>Verrouillée : " + reason + "</color>");
+            GUILayout.Space(8);
+            GUILayout.BeginHorizontal();
+            if (s == QuestState.Available && _npcId != null && q.givers.Contains(_npcId) && GUILayout.Button("Accepter la quête"))
+            {
+                _msg = QuestEngine.Accept(lp, q, _npcId);
+                if (_msg.Length == 0) { NpcTalk.Say(_viking, q.dlg["accepted"], true); lp.Message(MessageHud.MessageType.TopLeft, "Quête acceptée : " + q.name); }
+            }
+            if (s == QuestState.Ready && _npcId == q.turnIn && GUILayout.Button("Rendre la quête"))
+            {
+                string done; _msg = QuestEngine.TurnIn(lp, q, _npcId, out done);
+                if (_msg.Length == 0) NpcTalk.Say(_viking, done, true);
+            }
+            else if (s == QuestState.Ready && _npcId != q.turnIn) GUILayout.Label("À rendre auprès de " + QuestEngine.NpcName(q.turnIn) + ".");
+            if ((s == QuestState.Active || s == QuestState.Ready) && GUILayout.Button(_confirmAbandon == q.id ? "Confirmer l'abandon" : "Abandonner"))
+            {
+                if (_confirmAbandon == q.id) { _msg = QuestEngine.Abandon(lp, q); _confirmAbandon = null; } else _confirmAbandon = q.id;
+            }
+            GUILayout.EndHorizontal();
+        }
+        private static Dictionary<string, int> ProgOf(Player lp, QDef q)
+        {
+            Dictionary<string, int> d = new Dictionary<string, int>();
+            string v;
+            if (!lp.m_customData.TryGetValue("RP_QS_" + q.id, out v) || !v.StartsWith("A;", StringComparison.Ordinal)) return d;
+            foreach (string part in v.Substring(2).Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                int eq = part.IndexOf('='); int n;
+                if (eq > 0 && int.TryParse(part.Substring(eq + 1), out n)) d[part.Substring(0, eq)] = n;
+            }
+            return d;
+        }
+        // ---- game input patches (applied through ManagerNPCRP.Awake, wrapped in try/catch there)
+        internal static void TakeInputPostfix(ref bool __result) { if (_open) __result = false; }
+        internal static bool MouseCapturePrefix() { return !_open; }
+        // Diagnostic: list the input-related ZInput methods available in this game build.
+        foreach (MethodInfo method in AccessTools.GetDeclaredMethods(typeof(ZInput)))
+        {
+            string name = method.Name;
+            if (name.IndexOf("Button", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("Mouse", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("Key", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                _log.LogInfo("ZInput input method: " + name);
+            }
+        }
+        // Guaranteed gameplay-input block: runs immediately before Player.Update.
+        MethodInfo playerUpdate = AccessTools.Method(typeof(Player), "Update");
+        if (playerUpdate != null)
+        {
+            _harmony.Patch(
+                playerUpdate,
+                prefix: new HarmonyMethod(typeof(QuestUi), nameof(QuestUi.PlayerUpdatePrefix)));
+        }
+        else
+        {
+            _log.LogWarning("Player.Update not found: quest UI cannot block attacks reliably.");
         }
     }
 }
