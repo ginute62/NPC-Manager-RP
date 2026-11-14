@@ -1,0 +1,136 @@
+{
+  "worlds": {
+    "modbase": {
+      "companies": {},
+      "companyCounter": 1,
+      "switchAt": {},
+      "pvpKills": {},
+      "pvpDeaths": {},
+      "ledgers": {
+        "renegat": {
+          "clanPoints": {
+            "Rochouard": 16,
+            "Koenish": 4,
+            "Rudowlosy": 3
+          },
+          "clanNights": {
+            "Rochouard": 3
+          },
+          "clanNightPoints": {
+            "Rochouard": 12
+          },
+          "factionPoints": {
+            "DouzeCouronnes": 2.7,
+            "CamaradesAzures": 0.810000062,
+            "HordeSolaire": 0.269999981,
+            "Antagonistes": -0.675,
+            "Vagabonds": 0.0
+          }
+        },
+        "douze": {
+          "clanPoints": {
+            "Rochouard": 48,
+            "Rudowlosy": 3,
+            "Koenish": 4
+          },
+          "clanNights": {
+            "Rochouard": 11
+          },
+          "clanNightPoints": {
+            "Rochouard": 44
+          },
+          "factionPoints": {
+            "DouzeCouronnes": 4.61999941,
+            "CamaradesAzures": 1.38600016,
+            "HordeSolaire": 0.461999983,
+            "Antagonistes": -1.15499985,
+            "Vagabonds": 0.0
+          }
+        }
+      },
+      "playerCareer": {
+        "Modadm": "douze",
+        "Ginute": "douze"
+      },
+      "awarded": [
+        "douze|q_douze_car_douze_01|Rochouard",
+        "douze|q_douze_car_douze_01|Rudowlosy",
+        "douze|q_douze_car_douze_01|Koenish",
+        "renegat|fer_hook|Rochouard",
+        "renegat|hydromel_hook|Koenish",
+        "renegat|fer_hook|Rudowlosy"
+      ],
+      "dusk": {},
+      "wasNight": false,
+      "lastMonth": 1,
+      "history": []
+    },
+    "Utopia": {
+      "companies": {},
+      "companyCounter": 0,
+      "switchAt": {},
+      "pvpKills": {},
+      "pvpDeaths": {},
+      "ledgers": {
+        "renegat": {
+          "clanPoints": {
+            "Rochouard": 4
+          },
+          "clanNights": {
+            "Rochouard": 1
+          },
+          "clanNightPoints": {
+            "Rochouard": 4
+          },
+          "factionPoints": {
+            "DouzeCouronnes": 0.252,
+            "CamaradesAzures": 0.084,
+            "HordeSolaire": 0.0360000022,
+            "Antagonistes": -0.0479999967,
+            "Vagabonds": 0.24
+          }
+        },
+        "douze": {
+          "clanPoints": {
+            "Rochouard": 44,
+            "Rudowlosy": 3,
+            "Koenish": 7
+          },
+          "clanNights": {
+            "Rochouard": 10
+          },
+          "clanNightPoints": {
+            "Rochouard": 40
+          },
+          "factionPoints": {
+            "DouzeCouronnes": 13.7739935,
+            "CamaradesAzures": 5.53000069,
+            "HordeSolaire": 0.546,
+            "Antagonistes": -8.376002,
+            "Vagabonds": 1.07999992
+          }
+        }
+      },
+      "playerCareer": {
+        "Modadm": "douze",
+        "Ginute": "douze"
+      },
+      "awarded": [
+        "douze|fer_hook|Rochouard",
+        "douze|fer_hook|Rudowlosy",
+        "douze|relS1|Koenish"
+      ],
+      "dusk": {
+        "Modadm": "Rochouard"
+      },
+      "wasNight": true,
+      "lastMonth": 15,
+      "history": [
+        "Mois 1 [douze] DouzeCouronnes 5 (Inconnus) | CamaradesAzures 2 (Inconnus) | HordeSolaire 0 (Inconnus) | Vagabonds 0 (Inconnus) | Antagonistes -2 (Inconnus)",
+        "Mois 2 [douze] DouzeCouronnes 7 (Inconnus) | CamaradesAzures 3 (Inconnus) | HordeSolaire 0 (Inconnus) | Vagabonds 0 (Inconnus) | Antagonistes -4 (Inconnus)",
+        "Mois 3 [douze] DouzeCouronnes 9 (Inconnus) | CamaradesAzures 4 (Inconnus) | HordeSolaire 0 (Inconnus) | Vagabonds 0 (Inconnus) | Antagonistes -6 (Inconnus)",
+        "Mois 15 [douze] DouzeCouronnes 11 (Familiers) | CamaradesAzures 5 (Inconnus) | HordeSolaire 0 (Inconnus) | Vagabonds 0 (Inconnus) | Antagonistes -8 (Inconnus)"
+      ]
+    }
+  }
+}
