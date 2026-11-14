@@ -1,0 +1,93 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>ManagerNPCRP</AssemblyName>
+    <RootNamespace>NorsemanNpcRp</RootNamespace>
+    <OutputType>Library</OutputType>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <Configuration>Release</Configuration>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <NoWarn>CS0436;CS1701;CS1702</NoWarn>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <ValheimDir>E:\Games\Valheim</ValheimDir>
+    <ManagedDir>$(ValheimDir)\valheim_Data\Managed</ManagedDir>
+    <BepInExCore>$(ValheimDir)\BepInEx\core</BepInExCore>
+    <BepInExPlugins>$(ValheimDir)\BepInEx\plugins</BepInExPlugins>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="ManagerNPCRP.cs" />
+    <!-- Unity : ancien système Input -->
+    <Reference Include="UnityEngine.InputLegacyModule">
+      <HintPath>$(ManagedDir)\UnityEngine.InputLegacyModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- Valheim : utilitaires, Vector2i, StringExtensionMethods, etc. -->
+    <Reference Include="assembly_utils">
+      <HintPath>$(ManagedDir)\assembly_utils.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.IMGUIModule">
+    <HintPath>$(ManagedDir)\UnityEngine.IMGUIModule.dll</HintPath>
+    <Private>false</Private>
+    </Reference>
+    <Reference Include="assembly_valheim">
+      <HintPath>$(ManagedDir)\assembly_valheim.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>$(ManagedDir)\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.TextRenderingModule">
+   <HintPath>$(ValheimDir)\valheim_Data\Managed\UnityEngine.TextRenderingModule.dll</HintPath>
+   <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.PhysicsModule">
+      <HintPath>$(ManagedDir)\UnityEngine.PhysicsModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(ManagedDir)\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="BepInEx">
+      <HintPath>$(BepInExCore)\BepInEx.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(BepInExPlugins)\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- Dépendances -->
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>$(BepInExPlugins)\Newtonsoft.Json.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Norsemen">
+      <HintPath>$(BepInExPlugins)\Norsemen.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="LivingNorsemen">
+      <HintPath>$(BepInExPlugins)\LivingNorsemen.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ExpandWorldPrefabs">
+      <HintPath>$(BepInExPlugins)\ExpandWorldPrefabs.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Permet de compiler pour .NET Framework 4.8 avec dotnet build -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+</Project>
