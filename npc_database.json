@@ -15251,11 +15251,13 @@
   "factions": {
     "DouzeCouronnes": {
       "isFriendly": true,
-      "aggressiveVariant": "DouzeCouronnes_Hostile"
+      "aggressiveVariant": "DouzeCouronnes_Hostile",
+      "fallbackDialogueSet": "FallbackDouzeCouronnes"
     },
     "CamaradesAzures": {
       "isFriendly": true,
-      "aggressiveVariant": "CamaradesAzures_Hostile"
+      "aggressiveVariant": "CamaradesAzures_Hostile",
+      "fallbackDialogueSet": "FallbackCamaradesAzures"
     },
     "DvergOutpost": {
       "isFriendly": true,
@@ -15263,7 +15265,8 @@
     },
     "HordeSolaire": {
       "isFriendly": true,
-      "aggressiveVariant": "HordeSolaire_Hostile"
+      "aggressiveVariant": "HordeSolaire_Hostile",
+      "fallbackDialogueSet": "FallbackHordeSolaire"
     },
     "Neutre": {
       "isFriendly": true,
@@ -15271,23 +15274,28 @@
     },
     "HordeSolaire_Hostile": {
       "isFriendly": false,
-      "aggressiveVariant": null
+      "aggressiveVariant": null,
+      "fallbackDialogueSet": "FallbackHordeSolaire"
     },
     "DouzeCouronnes_Hostile": {
       "isFriendly": false,
-      "aggressiveVariant": ""
+      "aggressiveVariant": "",
+      "fallbackDialogueSet": "FallbackDouzeCouronnes"
     },
     "CamaradesAzures_Hostile": {
       "isFriendly": false,
-      "aggressiveVariant": ""
+      "aggressiveVariant": "",
+      "fallbackDialogueSet": "FallbackCamaradesAzures"
     },
     "Vagabonds": {
       "isFriendly": true,
-      "aggressiveVariant": ""
+      "aggressiveVariant": "",
+      "fallbackDialogueSet": "FallbackVagabonds"
     },
     "Antagonistes": {
       "isFriendly": false,
-      "aggressiveVariant": ""
+      "aggressiveVariant": "",
+      "fallbackDialogueSet": "FallbackAntagonistes"
     }
   },
   "clans": {
@@ -19429,6 +19437,171 @@
     }
   },
   "dialogueSets": {
+    "FallbackDouzeCouronnes": {
+      "Greets": [
+        "Les Douze Couronnes vous saluent.",
+        "Que faites-vous dans nos terres ?",
+        "Restez respectueux, voyageur."
+      ],
+      "Farewells": [
+        "Que les Couronnes vous protègent.",
+        "Au revoir.",
+        "Que votre route reste sûre."
+      ],
+      "Generic": [
+        "Les affaires de la Couronne ne concernent pas les étrangers.",
+        "Nous veillons sur cette ville.",
+        "Parlez vite, j’ai du travail.",
+        "Les routes sont dangereuses, ne vous éloignez pas sans raison."
+      ],
+      "PlayerBase": [
+        "Un beau domaine. La Couronne y veille."
+      ],
+      "Damaged": [
+        "Retirez-vous !",
+        "Vous cherchez la mort ?",
+        "Gardez vos distances !"
+      ],
+      "Thieved": [
+        "Ici, on ne vole pas.",
+        "Posez cela immédiatement."
+      ],
+      "Puke": [],
+      "Eat": [],
+      "stages": []
+    },
+    "FallbackCamaradesAzures": {
+      "Greets": [
+        "Les Camarades Azures vous reconnaissent.",
+        "Bienvenue parmi nous.",
+        "Le vent vous a conduit jusqu’ici."
+      ],
+      "Farewells": [
+        "Que le vent vous soit favorable.",
+        "À bientôt.",
+        "Bonne route, voyageur."
+      ],
+      "Generic": [
+        "La mer décide de bien des choses.",
+        "Nous n’abandonnons jamais les nôtres.",
+        "Chaque jour compte.",
+        "Les aurores guident mieux que les étoiles, parfois."
+      ],
+      "PlayerBase": [
+        "Un bon abri près de la mer."
+      ],
+      "Damaged": [
+        "Arrière !",
+        "Vous avez choisi la mauvaise cible !",
+        "Ne nous forcez pas !"
+      ],
+      "Thieved": [
+        "On ne vole pas un Camarade.",
+        "Rendez cela, maintenant."
+      ],
+      "Puke": [],
+      "Eat": [],
+      "stages": []
+    },
+    "FallbackHordeSolaire": {
+      "Greets": [
+        "La Horde vous observe.",
+        "Parlez, étranger.",
+        "Le feu ne pardonne pas les hésitants."
+      ],
+      "Farewells": [
+        "Que le feu vous accompagne.",
+        "Partez.",
+        "La Horde vous reconnaît."
+      ],
+      "Generic": [
+        "Les fournaises ne s’éteignent jamais.",
+        "Ce qui est faible doit être forgé ou abandonné.",
+        "Nous ne oublions pas les dettes.",
+        "La cendre raconte ce que les vivants taisent."
+      ],
+      "PlayerBase": [
+        "Un abri solide. Le feu y serait bien."
+      ],
+      "Damaged": [
+        "Vous avez attisé ma colère !",
+        "Reculez, si vous tenez à votre peau !",
+        "Le feu répondra !"
+      ],
+      "Thieved": [
+        "Voleur ? Vous ne repartirez pas entier.",
+        "Rendez ce que vous avez pris."
+      ],
+      "Puke": [],
+      "Eat": [],
+      "stages": []
+    },
+    "FallbackVagabonds": {
+      "Greets": [
+        "Bonjour, voyageur.",
+        "La route est longue, n’est-ce pas ?",
+        "Vous n’avez pas l’air d’être d’ici."
+      ],
+      "Farewells": [
+        "Bonne route.",
+        "Que le chemin vous soit clair.",
+        "À la prochaine croisade."
+      ],
+      "Generic": [
+        "Chaque route mène quelque part, même quand on ne sait pas où.",
+        "Les villes changent, les routes restent.",
+        "On apprend beaucoup en écoutant.",
+        "Un feu partagé vaut mieux qu’un toit fermé."
+      ],
+      "PlayerBase": [
+        "Un bon feu, un toit, voilà ce qui compte."
+      ],
+      "Damaged": [
+        "Laisse-moi tranquille !",
+        "Je ne veux pas de bagarre.",
+        "Recule !"
+      ],
+      "Thieved": [
+        "Ce n’est pas à toi.",
+        "Rends cela, voyons."
+      ],
+      "Puke": [],
+      "Eat": [],
+      "stages": []
+    },
+    "FallbackAntagonistes": {
+      "Greets": [
+        "Qu’est-ce que vous faites ici ?",
+        "Éloignez-vous.",
+        "Vous n’êtes pas les bienvenus."
+      ],
+      "Farewells": [
+        "Disparaissez.",
+        "Ne revenez pas.",
+        "La prochaine fois, nous ne parlerons pas."
+      ],
+      "Generic": [
+        "Ne vous mêlez pas de nos affaires.",
+        "Les faibles parlent, les forts agissent.",
+        "Nous ne devons rien à personne.",
+        "Partez avant que la patience s’épuise."
+      ],
+      "PlayerBase": [
+        "Un abri d’étrangers. Peu importe."
+      ],
+      "Damaged": [
+        "Vous avez fait une erreur !",
+        "À mort !",
+        "Vous regretterez cela !"
+      ],
+      "Thieved": [
+        "Voleur ! Vous paierez cela.",
+        "Rendez cela, ou mourez."
+      ],
+      "Puke": [],
+      "Eat": [],
+      "stages": []
+    },
     "Brasscience_Talks": {
       "Greets": [
         "Pose tes armes à l'entrée. Ici, on soigne, on ne combat pas.",
