@@ -330,6 +330,16 @@ namespace NorsemanNpcRp
                         $"'{fac.Value.aggressiveVariant}'.");
                     ok = false;
                 }
+
+                if (fac.Value != null &&
+                    !string.IsNullOrWhiteSpace(fac.Value.fallbackDialogueSet) &&
+                    !db.dialogueSets.ContainsKey(fac.Value.fallbackDialogueSet))
+                {
+                    _log.LogError(
+                        $"Faction '{fac.Key}' references unknown fallbackDialogueSet " +
+                        $"'{fac.Value.fallbackDialogueSet}'.");
+                    ok = false;
+                }
             }
             foreach (KeyValuePair<string, ClanDefinition> clan in db.clans)
             {
@@ -582,7 +592,10 @@ namespace NorsemanNpcRp
             zdo.Persistent = true;
             if (!prefabView.m_persistent)
                 _log.LogDebug($"[{id}] prefab '{npc.prefab}' is not persistent by default: forced persistent.");
-            zdo.Distant = prefabView.m_distant;
+            // Norsemen prefabs are cloned from the player prefab. Do not inherit
+            // its distant-networking range for RP citizens: keep them in the
+            // normal simulation area around connected players.
+            zdo.Distant = false;
             zdo.Type = prefabView.m_type;
             // Our persistent identity.
             zdo.Set(RpIdKey, id);
@@ -871,6 +884,10 @@ namespace NorsemanNpcRp
                 // Identity: displayed Norsemen name is stored in the normal tamed-name ZDO field.
                 if (nview.IsOwner())
                 {
+                    // Migrate existing RP ZDOs that were created with the prefab's
+                    // distant flag. Their persistent data remains saved; only the
+                    // extended network range is disabled.
+                    if (zdo.Distant) zdo.Distant = false;
                     zdo.Set(ZDOVars.s_tamedName, npc.identity.name);
                     zdo.Set(RpIdKey, id);
                     zdo.Set(ClanKey, npc.clan ?? "");
@@ -1094,28 +1111,63 @@ namespace NorsemanNpcRp
         }
         internal DialogueSetDefinition ResolveDialogueSet(NpcDefinition npc)
         {
-            string setName = npc.dialogue != null ? npc.dialogue.set : null;
-
-            ClanDefinition clan;
-            if (string.IsNullOrWhiteSpace(setName) && npc.clan != null &&
-                _database.clans.TryGetValue(npc.clan, out clan))
-                setName = clan.defaultDialogueSet;
-
-            DialogueSetDefinition set;
-            if (string.IsNullOrWhiteSpace(setName) ||
-                !_database.dialogueSets.TryGetValue(setName, out set))
+            if (npc == null || _database == null)
                 return null;
 
-            return set;
+            // 1. NPC-specific dialogue set.
+            string setName = npc.dialogue != null ? npc.dialogue.set : null;
+
+            DialogueSetDefinition set;
+            if (!string.IsNullOrWhiteSpace(setName) &&
+                _database.dialogueSets.TryGetValue(setName, out set))
+                return set;
+
+            // 2. Clan dialogue set.
+            ClanDefinition clan = null;
+            if (!string.IsNullOrWhiteSpace(npc.clan))
+                _database.clans.TryGetValue(npc.clan, out clan);
+
+            if (clan != null &&
+                !string.IsNullOrWhiteSpace(clan.defaultDialogueSet) &&
+                _database.dialogueSets.TryGetValue(clan.defaultDialogueSet, out set))
+                return set;
+
+            // 3. Faction fallback dialogue set.
+            // The NPC faction wins; otherwise use the faction declared by its clan.
+            string faction = !string.IsNullOrWhiteSpace(npc.faction)
+                ? npc.faction
+                : clan?.faction;
+
+            if (!string.IsNullOrWhiteSpace(faction) &&
+                _database.factions.TryGetValue(faction, out FactionDefinition factionDef) &&
+                !string.IsNullOrWhiteSpace(factionDef.fallbackDialogueSet) &&
+                _database.dialogueSets.TryGetValue(
+                    factionDef.fallbackDialogueSet, out set))
+                return set;
+
+            return null;
         }
         private void ApplyDialogue(Viking viking, NpcDefinition npc)
         {
             if (_database == null)
                 return;
+
             DialogueSetDefinition set = ResolveDialogueSet(npc);
+            Dictionary<string, List<string>> lists;
+
             if (set == null)
-                return;
-            Dictionary<string, List<string>> lists = DialogueStages.Effective(set);
+            {
+                // No NPC, clan or faction dialogue set is available.
+                // Clear the Norsemen dialogue fields so the English randomtalk
+                // fallback cannot leak through.
+                lists = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+                foreach (string category in DialogueStages.Categories)
+                    lists[category] = new List<string>();
+            }
+            else
+            {
+                lists = DialogueStages.Effective(set);
+            }
             // Grudge (killed NPC) or hostile clan: the NPC only speaks refusal lines.
             ReputationManager.Overlay(lists, ReputationManager.IdOf(viking), npc.clan);
             int applied = 0;
@@ -1414,9 +1466,14 @@ namespace NorsemanNpcRp
                 adminOnly: true);
             new NorseCommand(
                 "rp_audit",
-                "Server audit of RP NPCs: missing, duplicated, orphaned, non-persistent. 'rp_audit fix' repairs.",
+                "Server audit of RP NPCs. Use 'rp_audit fix' to repair duplicates/persistence or 'rp_audit distantfix' to limit RP NPC network range.",
                 args => { NpcLifecycle.AuditCommand(CmdArgs(args.Args, "rp_audit")); return true; },
                 adminOnly: true);
+            new NorseCommand(
+                "rp_npc_load",
+                "Show the Norsemen and RP NPCs currently loaded in this game client.",
+                args => { LogLocalNpcLoad(); return true; },
+                adminOnly: false);
             new NorseCommand(
                 "rp_check",
                 "Check loaded NPCs in the world: underground, in water, stuck, floating, drifted. rp_check [Clan|NPC-ID|all] [fix]",
@@ -1475,6 +1532,32 @@ namespace NorsemanNpcRp
                 "Story flags (world-wide): rp_flag list | rp_flag set <flag> | rp_flag clear <flag>",
                 args => { DialogueStages.FlagCommand(CmdArgs(args.Args, "rp_flag")); return true; },
                 adminOnly: true);
+        }
+
+        private static void LogLocalNpcLoad()
+        {
+            ManagerNPCRP plugin = Instance;
+            if (plugin == null || Player.m_localPlayer == null) return;
+
+            int loaded = 0, rp = 0, generated = 0, distant = 0;
+            foreach (Character character in Character.GetAllCharacters())
+            {
+                Viking viking = character as Viking;
+                if (viking == null || viking.IsDead()) continue;
+                loaded++;
+                ZNetView view = viking.GetComponent<ZNetView>();
+                ZDO zdo = view != null && view.IsValid() ? view.GetZDO() : null;
+                if (zdo == null) continue;
+                string id = zdo.GetString(RpIdKey, "");
+                if (string.IsNullOrEmpty(id)) continue;
+                rp++;
+                if (id.StartsWith("GEN-", StringComparison.Ordinal)) generated++;
+                if (zdo.Distant) distant++;
+            }
+
+            string report = $"rp_npc_load: {loaded} Norsemen loaded locally; {rp} RP NPCs ({generated} generated), {distant} still distant.";
+            plugin.Log.LogInfo(report);
+            Player.m_localPlayer.Message(MessageHud.MessageType.TopLeft, report);
         }
         private void ShowNpcInfo(string id)
         {
@@ -1540,6 +1623,10 @@ namespace NorsemanNpcRp
         {
             public bool isFriendly = true;
             public string aggressiveVariant;
+
+            // Optional French/RP fallback dialogue set used when an NPC has no
+            // individual dialogue set and its clan has no defaultDialogueSet.
+            public string fallbackDialogueSet;
         }
         [Serializable]
         public sealed class ClanDefinition
@@ -1860,10 +1947,11 @@ namespace NorsemanNpcRp
                 return;
             }
             bool fix = args.Any(a => a.Equals("fix", StringComparison.OrdinalIgnoreCase));
+            bool fixDistant = fix || args.Any(a => a.Equals("distantfix", StringComparison.OrdinalIgnoreCase));
             Dictionary<string, List<ZDO>> byId = plugin.CollectZdosById();
             List<string> lines = new List<string>();
-            int expected = 0, present = 0, missing = 0, duplicates = 0, orphans = 0, notPersistent = 0,
-                generated = 0, notPlaced = 0, gaveUp = 0, removed = 0;
+            int expected = 0, present = 0, missing = 0, duplicates = 0, orphans = 0, notPersistent = 0, distant = 0,
+                generated = 0, notPlaced = 0, gaveUp = 0, removed = 0, distantFixed = 0;
             foreach (KeyValuePair<string, ManagerNPCRP.NpcDefinition> kv in plugin.Npcs)
             {
                 ManagerNPCRP.SpawnPosition sp = kv.Value.locations != null ? kv.Value.locations.spawn : null;
@@ -1907,6 +1995,11 @@ namespace NorsemanNpcRp
                         notPersistent++;
                         if (fix) z.Persistent = true;
                     }
+                    if (z.Distant)
+                    {
+                        distant++;
+                        if (fixDistant) { z.Distant = false; distantFixed++; }
+                    }
                     if (!z.GetBool(NpcPlacement.PlacedKey, false)) notPlaced++;
                     if (z.GetBool(NpcPlacement.GaveUpKey, false))
                     {
@@ -1919,9 +2012,10 @@ namespace NorsemanNpcRp
             int loaded = Character.GetAllCharacters().Count(c => c is Viking);
             string summary = $"rp_audit: {expected} expected, {present} present, {missing} missing, " +
                              $"{duplicates} duplicated, {orphans} orphan ZDO(s), {generated} generated citizens, " +
-                             $"{notPersistent} non-persistent, {notPlaced} not placed yet, {gaveUp} placement gave up, " +
+                             $"{notPersistent} non-persistent, {distant} distant ZDO(s), {notPlaced} not placed yet, {gaveUp} placement gave up, " +
                              $"{dead.Count} awaiting respawn, {loaded} loaded in memory" +
-                             (fix ? $" | FIX: {removed} extra ZDO(s) removed, persistence forced." : ".");
+                             (fix ? $" | FIX: {removed} extra ZDO(s) removed, persistence forced, distant mode disabled."
+                                  : fixDistant ? $" | FIX: distant mode disabled on {distantFixed} ZDO(s)." : ".");
             lines.Insert(0, summary);
             foreach (string l in lines.Take(80)) plugin.Log.LogInfo(l);
             if (lines.Count > 80) plugin.Log.LogInfo($"... {lines.Count - 80} more line(s) in npc_audit.txt");
@@ -4475,7 +4569,7 @@ namespace NorsemanNpcRp
     internal static class DialogueStages
     {
         private const string FlagPrefix = "rp_";
-        private static readonly string[] Categories =
+        internal static readonly string[] Categories =
             { "Greets", "Farewells", "Generic", "PlayerBase", "Damaged", "Thieved", "Puke", "Eat" };
         /// <summary>Story flags are world-wide; rep_/repf_/grudge_ flags are resolved for the LOCAL player's career.</summary>
         internal static bool FlagOn(string flag)
@@ -5601,7 +5695,8 @@ namespace NorsemanNpcRp
             ZdoAccess.SetPrefab(zdo, prefabHash);
             ZdoAccess.SetRotation(zdo, new Vector3(0f, UnityEngine.Random.value * 360f, 0f));
             zdo.Persistent = true;   // generated citizens must survive restarts too
-            zdo.Distant = pv.m_distant;
+            // Generated citizens use the same local simulation range as named RP NPCs.
+            zdo.Distant = false;
             zdo.Type = pv.m_type;
             zdo.Set(RpIdKey, rpId);
             zdo.Set(ClanKey, clan);
