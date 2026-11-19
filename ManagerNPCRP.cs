@@ -58,7 +58,18 @@ namespace NorsemanNpcRp
             _log = Logger;
             _databasePath = Path.Combine(Paths.ConfigPath, ConfigFolderName, DatabaseFileName);
             _harmony = new Harmony(PluginGuid);
+            // la base d'abord : aucun patch réseau ne doit empêcher son chargement
             LoadDatabase();
+            // Allègement réseau/CPU multi : throttle ZDO des PNJ RP,
+            // scans Norsemen mutualisés, hygiène lastWorkTime + netstats.
+            // (no-op pour les non-owners : clients et solo ne sont pas affectés)
+            // chaque patch est isolé en try/catch : un mod absent/incompatible
+            // ne doit jamais interrompre le reste du Awake (dialogues, menus...).
+            try { RpNetThrottle.Apply(_harmony); }
+            catch (Exception ex)
+            {
+                _log.LogError("RpNetThrottle failed (network throttling disabled): " + ex);
+            }
             // Phase 3: attach to Norsemen prefab-definition creation.
             MethodInfo createMethod = AccessTools.Method(typeof(Norseman), "Create");
             if (createMethod != null)
@@ -99,10 +110,24 @@ namespace NorsemanNpcRp
                 if (onDeath != null)
                     _harmony.Patch(onDeath, postfix: new HarmonyMethod(typeof(ReputationManager),
                         nameof(ReputationManager.CharacterOnDeathPostfix)));
-                MethodInfo interact = AccessTools.Method(typeof(Viking), "Interact");
+                MethodInfo interact = AccessTools.Method(typeof(Viking), "Interact",
+                    new[] { typeof(Humanoid), typeof(bool), typeof(bool) });
                 if (interact != null)
                     _harmony.Patch(interact, prefix: new HarmonyMethod(typeof(ReputationManager),
                         nameof(ReputationManager.VikingInteractPrefix)));
+                // fallback si la surcharge 3-arg n'existe pas dans la DLL installée :
+                // patcher toutes les surcharges Interact(Humanoid,...)
+                foreach (MethodInfo vi in VikingInteractMethods())
+                    if (vi != interact)
+                        _harmony.Patch(vi, prefix: new HarmonyMethod(typeof(ReputationManager),
+                            nameof(ReputationManager.VikingInteractPrefix)));
+                // RP dialogues are resolved on interaction; this prefix is the
+                // final decision on whether the native Norsemen dialogue opens.
+                PatchNpcInteraction();
+                // le randomtalk YAML de Norsemen ne doit plus sortir d'un PNJ RP
+                RpTalkOverride.Apply(_harmony);
+                // tame/hunger désactivés pour les PNJ RP (Norsemen "bouffe")
+                RpTameOverride.Apply(_harmony);
                 MethodInfo gameStart = AccessTools.Method(typeof(Game), "Start");
                 if (gameStart != null)
                     _harmony.Patch(gameStart, postfix: new HarmonyMethod(typeof(ReputationManager),
@@ -202,6 +227,7 @@ namespace NorsemanNpcRp
         }
         private void Update()
         {
+            RpNetStats.Report();   // compteurs réseau (no-op si rp_netstats off)
             // T = existing dialogue, O = quest window. One interaction per frame, none while the quest window is open.
             bool talked = false;
             if (_talkKey != null && !QuestUi.IsOpen && Input.GetKeyDown(_talkKey.Value))
@@ -596,7 +622,9 @@ namespace NorsemanNpcRp
             // its distant-networking range for RP citizens: keep them in the
             // normal simulation area around connected players.
             zdo.Distant = false;
-            zdo.Type = prefabView.m_type;
+            zdo.Type = ZDO.ObjectType.Default;   // WAS prefabView.m_type (= Prioritized for player clones).
+                                                 // Prioritized NPC blobs starve players' ZDOs inside
+                                                 // the ~10 KB per-send budget of ZDOMan.SendZDOs.
             // Our persistent identity.
             zdo.Set(RpIdKey, id);
             zdo.Set(ClanKey, npc.clan ?? "");
@@ -888,6 +916,17 @@ namespace NorsemanNpcRp
                     // distant flag. Their persistent data remains saved; only the
                     // extended network range is disabled.
                     if (zdo.Distant) zdo.Distant = false;
+                    // Same migration for the Prioritized type inherited from the
+                    // player-clone prefab: RP NPC blobs must not compete with
+                    // players inside ZDOMan's per-send budget.
+                    if (zdo.Type != ZDO.ObjectType.Default) zdo.Type = ZDO.ObjectType.Default;
+                    // RP citizens are never tameable and never hungry: clear the
+                    // Norsemen feeding state persisted in old ZDOs (fresh ZDOs have
+                    // s_tameLastFeeding = 0 -> IsHungry() true forever -> the NPC
+                    // wanders to food like a tame).
+                    if (zdo.GetBool(ZDOVars.s_tamed)) zdo.Set(ZDOVars.s_tamed, false);
+                    if (ZNet.instance != null)
+                        zdo.Set(ZDOVars.s_tameLastFeeding, ZNet.instance.GetTime().Ticks);
                     zdo.Set(ZDOVars.s_tamedName, npc.identity.name);
                     zdo.Set(RpIdKey, id);
                     zdo.Set(ClanKey, npc.clan ?? "");
@@ -909,9 +948,11 @@ namespace NorsemanNpcRp
                 // m_faction is a local field (not synced by ZDO): every client must set it.
                 ApplyFaction(viking, npc);
                 ApplyGuardBehaviour(viking, npc);
-                // Dialogue text is local too; re-applied once later in case Norsemen overwrites it.
-                ApplyDialogue(viking, npc);
-                StartCoroutine(ReapplyDialogueLater(viking, npc));
+                // Dialogue: the RP database is the single source of truth (NpcTalk).
+                // Nothing is injected into the Norsemen prefab anymore; conversations
+                // are resolved on interaction via NpcTalk.VikingInteractPrefix.
+                // Story stages / faction changes still re-evaluated periodically.
+                StartCoroutine(ReapplyStageLater(viking, npc));
                 PopulationManager.AttachWanderer(viking, nview, zdo, npc, id);
                 if (_database.settings.debug)
                     _log.LogInfo(
@@ -1074,25 +1115,18 @@ namespace NorsemanNpcRp
                 $"[{npc.identity.name}] equipment set '{npc.equipmentSet}' applied.");
         }
         // ---------------------------------------------------------------------
-        // DIALOGUES (reflection: Norsemen's dialogue fields are not part of a public API)
+        // DIALOGUES — NpcTalk est la source unique (base JSON). Aucune injection
+        // dans le prefab Norsemen : les conversations sont résolues à l'interaction
+        // (Viking.Interact) et à la touche de discussion via NpcTalk.
         // ---------------------------------------------------------------------
-        private static readonly Dictionary<string, string[]> DialogueAliases =
-            new Dictionary<string, string[]>
-            {
-                { "Greets", new[] { "greets", "greet", "randomgreets" } },
-                { "Farewells", new[] { "farewells", "farewell", "goodbye", "randomgoodbye" } },
-                { "Generic", new[] { "generic", "randomtalk" } },
-                { "PlayerBase", new[] { "playerbase", "randomtalkinplayerbase" } },
-                { "Damaged", new[] { "damaged", "aggravated" } },
-                { "Thieved", new[] { "thieved", "stolen", "privateareaalarm" } },
-                { "Puke", new[] { "puke", "vomit" } },
-                { "Eat", new[] { "eat", "eating" } }
-            };
-        private bool _dialogueDiscoveryLogged;
-        private System.Collections.IEnumerator ReapplyDialogueLater(Viking viking, NpcDefinition npc)
+        /// <summary>
+        /// Re-evaluates story stages every 15 s for faction/guard behaviour only.
+        /// (Formerly ReapplyDialogueLater: the dialogue-field mapping was removed —
+        /// dialogues now come exclusively from the RP database via NpcTalk.)
+        /// </summary>
+        private System.Collections.IEnumerator ReapplyStageLater(Viking viking, NpcDefinition npc)
         {
             yield return new WaitForSeconds(2f);
-            // Re-evaluate story stages every 15 s; lines are only re-applied when a flag changed.
             string last = null;
             while (viking != null)
             {
@@ -1102,8 +1136,7 @@ namespace NorsemanNpcRp
                 if (last == null || signature != last)
                 {
                     ApplyFaction(viking, npc);
-                ApplyGuardBehaviour(viking, npc);
-                    ApplyDialogue(viking, npc);
+                    ApplyGuardBehaviour(viking, npc);
                     last = signature;
                 }
                 yield return new WaitForSeconds(15f);
@@ -1147,82 +1180,6 @@ namespace NorsemanNpcRp
 
             return null;
         }
-        private void ApplyDialogue(Viking viking, NpcDefinition npc)
-        {
-            if (_database == null)
-                return;
-
-            DialogueSetDefinition set = ResolveDialogueSet(npc);
-            Dictionary<string, List<string>> lists;
-
-            if (set == null)
-            {
-                // No NPC, clan or faction dialogue set is available.
-                // Clear the Norsemen dialogue fields so the English randomtalk
-                // fallback cannot leak through.
-                lists = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-                foreach (string category in DialogueStages.Categories)
-                    lists[category] = new List<string>();
-            }
-            else
-            {
-                lists = DialogueStages.Effective(set);
-            }
-            // Grudge (killed NPC) or hostile clan: the NPC only speaks refusal lines.
-            ReputationManager.Overlay(lists, ReputationManager.IdOf(viking), npc.clan);
-            int applied = 0;
-            List<string> discovered = new List<string>();
-            BindingFlags flags = BindingFlags.Instance | BindingFlags.Public |
-                                 BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
-            foreach (Component comp in viking.GetComponentsInChildren<Component>(true))
-            {
-                if (comp == null)
-                    continue;
-
-                for (Type t = comp.GetType();
-                     t != null && t != typeof(MonoBehaviour) && t != typeof(Component) &&
-                     t != typeof(object);
-                     t = t.BaseType)
-                {
-                    foreach (FieldInfo f in t.GetFields(flags))
-                    {
-                        bool isList = f.FieldType == typeof(List<string>);
-                        bool isArray = f.FieldType == typeof(string[]);
-                        if (!isList && !isArray)
-                            continue;
-
-                        discovered.Add($"{t.Name}.{f.Name}");
-                        string norm = f.Name.ToLowerInvariant().Replace("m_", "").Replace("_", "");
-
-                        foreach (KeyValuePair<string, string[]> alias in DialogueAliases)
-                        {
-                            if (Array.IndexOf(alias.Value, norm) < 0)
-                                continue;
-
-                            List<string> source;
-                            if (!lists.TryGetValue(alias.Key, out source) ||
-                                source == null || source.Count == 0)
-                                continue;
-
-                            f.SetValue(comp, isList
-                                ? (object)new List<string>(source)
-                                : source.ToArray());
-                            applied++;
-                        }
-                    }
-                }
-            }
-            if (_database.settings.debug && !_dialogueDiscoveryLogged)
-            {
-                _dialogueDiscoveryLogged = true;
-                _log.LogInfo(
-                    $"Dialogue: {applied} field(s) mapped on '{viking.name}'. " +
-                    $"String-list fields found: {string.Join(", ", discovered.ToArray())}");
-                if (applied == 0)
-                    _log.LogWarning(
-                        "No dialogue field matched. Send this field list so aliases can be adjusted.");
-            }
-        }
         // ---------------------------------------------------------------------
         // SAVE (used by in-game editing commands)
         // ---------------------------------------------------------------------
@@ -1265,6 +1222,59 @@ namespace NorsemanNpcRp
                 }
             }
             return raw;
+        }
+
+        /// <summary>
+        /// Toutes les surcharges Interact(Humanoid, ...) déclarées par Viking.
+        /// Le jeu appelle l'interface Interactable.Interact(Humanoid, bool) (2 args)
+        /// ; Norsemen déclare aussi Interact(Humanoid, bool, bool). Selon la build
+        /// installée, l'une OU l'autre (ou les deux) existent : on patche tout ce
+        /// qui commence par un Humanoid pour ne jamais rater l'appel réel du jeu.
+        /// </summary>
+        private List<MethodInfo> VikingInteractMethods()
+        {
+            List<MethodInfo> list = new List<MethodInfo>();
+            foreach (MethodInfo m in AccessTools.GetDeclaredMethods(typeof(Viking)))
+            {
+                if (!string.Equals(m.Name, "Interact", StringComparison.Ordinal)) continue;
+                ParameterInfo[] p = m.GetParameters();
+                if (p.Length > 0 && typeof(Humanoid).IsAssignableFrom(p[0].ParameterType))
+                    list.Add(m);
+            }
+            return list;
+        }
+
+        /// <summary>
+        /// Patches every Viking.Interact overload with NpcTalk.VikingInteractPrefix.
+        /// Order: ReputationManager prefix (deliberate blocking: hostile NPC /
+        /// insufficient reputation) runs first, then NpcTalk decides whether the
+        /// RP dialogue or the native Norsemen dialogue opens.
+        /// </summary>
+        private void PatchNpcInteraction()
+        {
+            try
+            {
+                List<MethodInfo> overloads = VikingInteractMethods();
+                if (overloads.Count == 0)
+                {
+                    _log.LogWarning(
+                        "Viking.Interact(Humanoid,...) not found: RP dialogues will only answer the talk key.");
+                    return;
+                }
+                foreach (MethodInfo interact in overloads)
+                {
+                    _harmony.Patch(interact,
+                        prefix: new HarmonyMethod(typeof(NpcTalk), nameof(NpcTalk.VikingInteractPrefix)));
+                    _log.LogInfo($"[RP INTERACT] Viking.Interact patched ({interact.GetParameters().Length} args) for RP dialogues.");
+                }
+                // diagnostic : si aucune de ces lignes n'apparaît au démarrage, la
+                // DLL Norsemen installée n'expose aucune surcharge patchable ->
+                // envoyer le log complet.
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning("Viking.Interact dialogue patch unavailable: " + ex.Message);
+            }
         }
 
         private void RegisterCommands()
@@ -1499,7 +1509,7 @@ namespace NorsemanNpcRp
                 adminOnly: false);
             new NorseCommand(
                 "rp_playercareer",
-                "Assign a career to a player: rp_playercareer <player> <career> (admin client or server).",
+                "Assigne une carière au joueur: rp_playercareer <player> <career> (admin client or server).",
                 args => { ReputationManager.BindCommandArgs(CmdArgs(args.Args, "rp_playercareer"), 1); return true; },
                 adminOnly: true);
             new NorseCommand(
@@ -1531,6 +1541,22 @@ namespace NorsemanNpcRp
                 "rp_flag",
                 "Story flags (world-wide): rp_flag list | rp_flag set <flag> | rp_flag clear <flag>",
                 args => { DialogueStages.FlagCommand(CmdArgs(args.Args, "rp_flag")); return true; },
+                adminOnly: true);
+            new NorseCommand(
+                "rp_netstats",
+                "Network diagnostics: rp_netstats on|off — count ZDO blobs/s and estimated KB/s sent for the RP NPC pool.",
+                args =>
+                {
+                    string[] a = CmdArgs(args.Args, "rp_netstats");
+                    string sub = a.Length > 1 ? a[1].ToLowerInvariant() : "";
+                    if (sub == "on") RpNetStats.Enabled = true;
+                    else if (sub == "off") RpNetStats.Enabled = false;
+                    if (Player.m_localPlayer != null)
+                        Player.m_localPlayer.Message(MessageHud.MessageType.TopLeft,
+                            $"rp_netstats: {(RpNetStats.Enabled ? "ON" : "OFF")} (read console)");
+                    _log.LogInfo($"rp_netstats {(RpNetStats.Enabled ? "enabled" : "disabled")}.");
+                    return true;
+                },
                 adminOnly: true);
         }
 
@@ -3588,7 +3614,7 @@ namespace NorsemanNpcRp
             {
                 _lastPrompt = Time.time;
                 lp.Message(MessageHud.MessageType.Center,
-                    "Choisissez votre allégeance : rp_career renegat | azures | douze | horde | antagoniste");
+                    "Choisissez votre allégeance : onglet renegat | azures | douze | horde | antagoniste");
             }
         }
 
@@ -4224,7 +4250,8 @@ namespace NorsemanNpcRp
                 if (!LastRefusal.TryGetValue(id, out last) || Time.time - last > 2.5f)
                 {
                     LastRefusal[id] = Time.time;
-                    NpcTalk.Say(__instance, Pick(RefusalLines(id, npc.clan)), false);
+                    NpcTalk.Say(__instance, npc.identity != null ? npc.identity.name : "",
+                                Pick(RefusalLines(id, npc.clan)), false);
                 }
 
                 __result = false;
@@ -4341,6 +4368,9 @@ namespace NorsemanNpcRp
     {
         private const string HeardKey = "RP_Heard";
         private const string TalksPrefix = "RP_Talks_";
+        // identique à ManagerNPCRP.RpIdKey (const privée de la classe hôte)
+        private const string RpIdKey = "NorsemanNPC_RP_ID";
+        private static readonly Dictionary<string, float> LastTalk = new Dictionary<string, float>();
         private sealed class KnowEntry
         {
             public string text = "";
@@ -4352,9 +4382,14 @@ namespace NorsemanNpcRp
         }
         internal static void Say(Viking v, string text, bool large)
         {
+            Say(v, "", text, large);
+        }
+
+        internal static void Say(Viking v, string name, string text, bool large)
+        {
             if (v == null || Chat.instance == null || string.IsNullOrEmpty(text)) return;
             float ttl = Mathf.Clamp(2.5f + text.Length * 0.055f, 3.5f, 12f);
-            Chat.instance.SetNpcText(v.gameObject, Vector3.up * 2.2f, 40f, ttl, "", text, large);
+            Chat.instance.SetNpcText(v.gameObject, Vector3.up * 2.2f, 40f, ttl, name ?? "", text, large);
         }
         private static List<string> StrList(JToken t)
         {
@@ -4454,15 +4489,107 @@ namespace NorsemanNpcRp
                 plugin.Log.LogInfo("[RP TALK] no RP NPC within 3.5 m.");
             }
         }
-        private static void Talk(Player lp, Viking v, string id, ManagerNPCRP.NpcDefinition npc)
+        /// <summary>
+        /// Harmony prefix on Viking.Interact(Humanoid, bool, bool).
+        /// RP NPC only: resolves the dialogue from the RP database and blocks the
+        /// native Norsemen dialogue when one was shown. Non-RP NPCs and unknown
+        /// ids fall through (return true) so Norsemen keeps its normal behaviour.
+        /// Order of prefixes on Interact: ReputationManager.VikingInteractPrefix
+        /// runs first (it blocks ONLY on deliberate refusal), then this one decides.
+        /// </summary>
+        internal static bool VikingInteractPrefix(Viking __instance, Humanoid __0, ref bool __result)
+        {
+            try
+            {
+                Player lp = __0 as Player;
+                if (lp == null || lp != Player.m_localPlayer) return true;
+                if (UiBlocked()) return true;
+
+                // Étape 1 : ZNetView ; Étape 2 : NorsemanNPC_RP_ID ; Étape 3 : la base RP
+                ZNetView nview = __instance.GetComponent<ZNetView>();
+                if (nview == null || nview.GetZDO() == null) return true;
+                string id = nview.GetZDO().GetString(RpIdKey, "");
+                if (string.IsNullOrEmpty(id)) return true;                  // PNJ standard -> Norsemen
+                ManagerNPCRP plugin = ManagerNPCRP.Instance;
+                if (plugin == null || plugin.Database == null || plugin.Npcs == null) return true;
+                ManagerNPCRP.NpcDefinition npc;
+                if (!plugin.Npcs.TryGetValue(id, out npc) &&
+                    !PopulationManager.TryResolveGenerated(nview.GetZDO(), id, out npc))
+                    return true;                                            // id inconnu -> Norsemen
+
+                // Anti-spam : une ligne par PNJ et par 1,5 s (les knows ne brûlent pas
+                // en maintenant E). Le refus est géré par ReputationManager en amont.
+                float last;
+                if (LastTalk.TryGetValue(id, out last) && Time.time - last < 1.5f)
+                {
+                    __result = true;
+                    return false;
+                }
+                LastTalk[id] = Time.time;
+
+                // id + npc déjà résolus ci-dessus : on appelle directement le moteur
+                bool shown = Talk(lp, __instance, id, npc);
+                if (plugin.Database.settings != null && plugin.Database.settings.debug)
+                    plugin.Log.LogInfo($"[RP INTERACT] id={id} shown={shown} refusing={ReputationManager.IsRefusing(id, npc.clan)}");
+                if (shown)
+                {
+                    QuestEngine.AfterTalk(id);
+                    __result = true;
+                    return false;                                           // dialogue RP -> Norsemen bloqué
+                }
+                return true;                                                // aucun dialogue RP dispo -> Norsemen
+            }
+            catch
+            {
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Resolves the rpId + NpcDefinition from the Viking's ZDO and shows the
+        /// dialogue chosen by the existing engine (reputation overlay, knows
+        /// entries, reserved lines, story stages). Returns true when something
+        /// was displayed. The reputation logic is NOT rewritten: Talk() is reused.
+        /// </summary>
+        internal static bool TryTalkTo(Viking npc)
+        {
+            Player lp = Player.m_localPlayer;
+            ManagerNPCRP plugin = ManagerNPCRP.Instance;
+            if (npc == null || lp == null || plugin == null || plugin.Database == null) return false;
+
+            ZNetView nview = npc.GetComponent<ZNetView>();
+            if (nview == null || nview.GetZDO() == null) return false;
+            string id = nview.GetZDO().GetString(RpIdKey, "");
+            if (string.IsNullOrEmpty(id)) return false;                     // pas un PNJ RP
+
+            ManagerNPCRP.NpcDefinition def;
+            if (!plugin.Npcs.TryGetValue(id, out def) &&
+                !PopulationManager.TryResolveGenerated(nview.GetZDO(), id, out def))
+                return false;
+
+            float last;
+            if (LastTalk.TryGetValue(id, out last) && Time.time - last < 1.5f) return true;
+            LastTalk[id] = Time.time;
+
+            bool shown = Talk(lp, npc, id, def);
+            if (shown) QuestEngine.AfterTalk(id);
+            return shown;
+        }
+
+        /// <summary>
+        /// Existing dialogue engine (knows -> rep-gated -> reserved -> generic).
+        /// Returns true when a line was actually displayed; the name shown on the
+        /// NPC bubble always comes from npc.identity.name, never from the prefab.
+        /// </summary>
+        private static bool Talk(Player lp, Viking v, string id, ManagerNPCRP.NpcDefinition npc)
         {
             ManagerNPCRP plugin = ManagerNPCRP.Instance;
             ReputationSettings rep = plugin.Database.reputation;
             // Killed-and-respawned NPC, or a clan hostile to the company: no conversation.
             if (ReputationManager.IsRefusing(id, npc.clan))
             {
-                Say(v, ReputationManager.Pick(ReputationManager.RefusalLines(id, npc.clan)), true);
-                return;
+                Say(v, npc.identity.name, ReputationManager.Pick(ReputationManager.RefusalLines(id, npc.clan)), true);
+                return true;
             }
             int tier = ReputationManager.TierFor(npc);
             int talks = Talks(lp, id) + 1;
@@ -4484,23 +4611,27 @@ namespace NorsemanNpcRp
             }
             if (chosen != null)
             {
-                Say(v, chosen.text, true);
+                Say(v, npc.identity.name, chosen.text, true);
                 heard.Add(chosenId);
                 lp.m_customData[HeardKey] = string.Join(",", heard.ToArray());
                 foreach (string flag in chosen.unlocks)
                     if (!DialogueStages.FlagOn(flag) && ZoneSystem.instance != null)
                         ZoneSystem.instance.SetGlobalKey("rp_" + flag);
                 lp.Message(MessageHud.MessageType.TopLeft, "Journal mis à jour : " + npc.identity.name);
-                return;
+                return true;
             }
             if (gatedByRep && rep.texts.reserved.Count > 0)
             {
-                Say(v, ReputationManager.Pick(rep.texts.reserved[Mathf.Min(tier, rep.texts.reserved.Count - 1)]), true);
-                return;
+                Say(v, npc.identity.name,
+                    ReputationManager.Pick(rep.texts.reserved[Mathf.Min(tier, rep.texts.reserved.Count - 1)]), true);
+                return true;
             }
             ManagerNPCRP.DialogueSetDefinition set = plugin.ResolveDialogueSet(npc);
             List<string> generic = set != null ? DialogueStages.Effective(set)["Generic"] : null;
-            Say(v, ReputationManager.Pick(generic), true);
+            if (generic == null || generic.Count == 0)
+                return false;                                               // rien à dire -> Norsemen peut prendre la main
+            Say(v, npc.identity.name, ReputationManager.Pick(generic), true);
+            return true;
         }
         internal static void JournalCommand()
         {
@@ -4547,6 +4678,154 @@ namespace NorsemanNpcRp
             }
         }
     }
+
+    // =====================================================================
+    // RP TALK OVERRIDE : Norsemen fait parler ses PNJ toutes les ~10 s avec
+    // ses lignes YAML (TalkManager : Greets/Farewells/Generic/PlayerBase).
+    // Pour les PNJ RP on remplace ce flot par les lignes de la base RP, et
+    // on NE JAMAIS laisse passer le YAML.
+    // =====================================================================
+    internal static class RpTalkOverride
+    {
+        private static readonly string[] GreetEmotes = { "emote_wave", "emote_bow" };
+
+        public static void Apply(Harmony harmony)
+        {
+            MethodInfo updateTalk = AccessTools.Method(typeof(Viking), "UpdateTalk");
+            if (updateTalk == null)
+            {
+                ZLog.LogWarning("[RpTalkOverride] Viking.UpdateTalk introuvable : le randomtalk YAML restera actif.");
+                return;
+            }
+            harmony.Patch(updateTalk,
+                prefix: new HarmonyMethod(AccessTools.Method(typeof(RpTalkOverride), nameof(Prefix))));
+        }
+
+        private static bool Prefix(Viking __instance, float dt)
+        {
+            try
+            {
+                ZNetView nview = __instance.GetComponent<ZNetView>();
+                if (!RpNetKeys.IsRpNpc(nview)) return true;      // PNJ standard : YAML Norsemen normal
+
+                // silencieux tant que alerté / en suivi (comme l'original)
+                if (__instance.m_vikingAI != null && __instance.m_vikingAI.IsAlerted()) return false;
+                if (__instance.IsFollowing()) return false;
+
+                // même cadence que l'original (m_randomTalkInterval)
+                __instance.m_randomTalkTimer += dt;
+                if (__instance.m_randomTalkTimer < __instance.m_randomTalkInterval) return false;
+                __instance.m_randomTalkTimer = 0f;
+                if (UnityEngine.Random.value > __instance.m_randomTalkChance) return false;
+
+                __instance.UpdateTarget();
+                Dictionary<string, List<string>> lists = LinesFor(nview.GetZDO());
+                if (lists != null)
+                {
+                    if (__instance.m_targetPlayer == null)
+                    {
+                        if (__instance.InPlayerBase())
+                            TryQueue(__instance, lists, "PlayerBase", null, Viking.talkFX);
+                    }
+                    else if (__instance.m_seeTarget)
+                    {
+                        float d = Vector3.Distance(
+                            __instance.m_targetPlayer.transform.position, __instance.transform.position);
+                        if (!__instance.m_didGreet && d < __instance.m_greetRange)
+                        {
+                            __instance.m_didGreet = true;
+                            string emote = GreetEmotes[UnityEngine.Random.Range(0, GreetEmotes.Length)];
+                            TryQueue(__instance, lists, "Greets", emote, Viking.greetFX);
+                        }
+                        if (__instance.m_didGreet && !__instance.m_didGoodbye && d > __instance.m_byeRange)
+                        {
+                            __instance.m_didGoodbye = true;
+                            string emote = GreetEmotes[UnityEngine.Random.Range(0, GreetEmotes.Length)];
+                            TryQueue(__instance, lists, "Farewells", emote, Viking.goodbyeFX);
+                        }
+                        if (__instance.m_didGreet && __instance.m_didGoodbye)
+                            TryQueue(__instance, lists, "Generic", null, Viking.talkFX);
+                    }
+                }
+                __instance.UpdateSayQueue();
+                return false;                                    // jamais le YAML pour un PNJ RP
+            }
+            catch { return false; }
+        }
+
+        // lignes RP : DialogueSet (npc -> clan -> faction) + overlay réputation,
+        // mêmes catégories que Norsemen (Greets/Farewells/Generic/PlayerBase)
+        private static Dictionary<string, List<string>> LinesFor(ZDO zdo)
+        {
+            ManagerNPCRP plugin = ManagerNPCRP.Instance;
+            if (plugin == null || plugin.Database == null || zdo == null) return null;
+            string id = zdo.GetString(RpNetKeys.RpIdKey, "");
+            if (string.IsNullOrEmpty(id)) return null;
+            ManagerNPCRP.NpcDefinition npc;
+            if (!plugin.Npcs.TryGetValue(id, out npc) &&
+                !PopulationManager.TryResolveGenerated(zdo, id, out npc)) return null;
+            Dictionary<string, List<string>> lists;
+            ManagerNPCRP.DialogueSetDefinition set = plugin.ResolveDialogueSet(npc);
+            if (set != null) lists = DialogueStages.Effective(set);
+            else
+            {
+                lists = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+                foreach (string category in DialogueStages.Categories)
+                    lists[category] = new List<string>();
+            }
+            ReputationManager.Overlay(lists, id, npc.clan);
+            return lists;
+        }
+
+        private static void TryQueue(Viking v, Dictionary<string, List<string>> lists,
+            string category, string trigger, EffectListRef effect)
+        {
+            List<string> src;
+            if (!lists.TryGetValue(category, out src) || src == null || src.Count == 0) return;
+            v.QueueSay(src, trigger: trigger ?? "", effect: effect);
+        }
+    }
+
+    // =====================================================================
+    // RP TAME OVERRIDE : les PNJ RP se comportent comme des animaux en
+    // apprivoisement parce que les prefabs Norseman sont "tameable" dans la
+    // config Norsemen :
+    //   - Tameable.TamingUpdate (3 s) fait progresser l'apprivoisement + HUD,
+    //   - IsHungry() : s_tameLastFeeding = 0 dans un ZDO neuf -> faim PERMANENTE
+    //     -> les PNJ errent vers la nourriture (VikingAI.UpdateConsumeSearch)
+    //     et somec de l'inventaire comme un tame.
+    // Correctif manager : tame/hunger désactivés pour les PNJ RP uniquement.
+    // =====================================================================
+    [HarmonyPatch]
+    internal static class RpTameOverride
+    {
+        public static void Apply(Harmony harmony)
+        {
+            Harmony.CreateAndPatchAll(typeof(RpTameOverride), harmony.Id);
+        }
+
+        private static bool IsRp(Viking v)
+        {
+            return v != null && RpNetKeys.IsRpNpc(v.GetComponent<ZNetView>());
+        }
+
+        // pas d'apprivoisement (ni HUD de tame, ni s_tamed -> s_tamedName reste
+        // uniquement le nom d'affichage RP)
+        [HarmonyPrefix]
+        [HarmonyPatch(typeof(Viking), "TamingUpdate")]
+        private static bool TamingPrefix(Viking __instance) => !IsRp(__instance);
+
+        // jamais faim : plus de quête de nourriture, travaille sans bouffe
+        [HarmonyPrefix]
+        [HarmonyPatch(typeof(Viking), "IsHungry")]
+        private static bool HungryPrefix(Viking __instance, ref bool __result)
+        {
+            if (!IsRp(__instance)) return true;
+            __result = false;
+            return false;
+        }
+    }
+
     // =====================================================================
     // STORY STAGES (dialogue lines unlocked by world flags)
     // =====================================================================
@@ -8325,6 +8604,346 @@ namespace NorsemanNpcRp
 
             Cursor.visible = true;
             Cursor.lockState = CursorLockMode.None;
+        }
+    }
+
+    // =================================================================
+    // NETWORK / CPU THROTTLE (fusionné depuis RpNetThrottlePatch.cs)
+    //
+    // Cause racine du lag multi (confirmée dans assembly_valheim 1.0) :
+    //   - ZSyncTransform.OwnerSync() (LateUpdate, côté owner) écrit
+    //     SetPosition + Set("vel") à CHAQUE frame pour chaque PNJ qui
+    //     bouge -> ZDO.m_dataRevision++ à chaque frame.
+    //   - Character.SyncVelocity() (FixedUpdate) écrit "BodyVelocity"
+    //     à 50 Hz tant que la vitesse change.
+    //   - ZDOMan.SendZDOs() renvoie, toutes les 0.05 s par peer, le ZDO
+    //     ENTIERS sérialisé (position + TOUTES les clés, pas de delta)
+    //     dès que m_dataRevision a changé. Budget ~10 Ko sinon stall.
+    //   - Avec 1045 PNJ dans la zone active (3x3 zones = 96 m autour de
+    //     chaque joueur), la file de 10 Ko ne se vide jamais. En solo,
+    //     ZDOMan.m_peers est vide -> aucun envoi -> aucun lag réseau.
+    //
+    // Bootstrap : RpNetThrottle.Apply(_harmony) est appelé dans Awake().
+    // Les compteurs s'activent avec la commande "rp_netstats on".
+    // =================================================================
+    internal static class RpNetThrottle
+    {
+        public static void Apply(Harmony harmony)
+        {
+            // CreateAndPatchAll est statique : il crée des instances Harmony
+            // dédiées, ce qui est sans effet sur le patching global.
+            // CHAQUE patch est isolé : un échec (méthode absente d'une version
+            // de mod) ne doit JAMAIS interrompre le reste du Awake.
+            PatchSafe(harmony, typeof(ZstOwnerSyncThrottle));
+            PatchSafe(harmony, typeof(CharacterSyncVelocityThrottle));
+            PatchSafe(harmony, typeof(VikingAiAwakeStaggerReal));
+            GuardThreatSharedScan.Apply(harmony);   // reflection : pas de ref dure à LivingNorsemen.dll
+            PatchSafe(harmony, typeof(ZdoLongWriteDamp));
+            // instrumentation : patchée aussi, mais inactive tant que
+            // RpNetStats.Enabled == false
+            PatchSafe(harmony, typeof(RpNetStats));
+        }
+
+        private static void PatchSafe(Harmony harmony, System.Type type)
+        {
+            try { Harmony.CreateAndPatchAll(type, harmony.Id); }
+            catch (Exception ex)
+            {
+                ZLog.LogWarning($"[RpNetThrottle] patch {type.Name} ignore: {ex.Message}");
+            }
+        }
+    }
+
+    // clé d'identité RP (doit rester identique à ManagerNPCRP.RpIdKey)
+    internal static class RpNetKeys
+    {
+        internal const string RpIdKey = "NorsemanNPC_RP_ID";
+
+        internal static bool IsRpNpc(ZNetView view)
+        {
+            if (view == null || !view.IsValid()) return false;
+            ZDO zdo = view.GetZDO();
+            if (zdo == null) return false;
+            // Un ZDO RP porte toujours l'identité persistante.
+            string id = zdo.GetString(RpIdKey, null);
+            return !string.IsNullOrEmpty(id);
+        }
+
+        internal static float NearestPlayerDistance(Vector3 pos)
+        {
+            float best = float.MaxValue;
+            List<Player> players = Player.GetAllPlayers();
+            for (int i = 0; i < players.Count; i++)
+            {
+                Player p = players[i];
+                if (p == null) continue;
+                float d = Vector3.Distance(p.transform.position, pos);
+                if (d < best) best = d;
+            }
+            return best;
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 1) Throttle de l'écriture position/vel dans le ZDO (owner = hôte)
+    //    ZSyncTransform.OwnerSync est appelé en LateUpdate par frame ;
+    //    on le laisse passer seulement à intervalle régulier.
+    // ---------------------------------------------------------------
+    [HarmonyPatch]
+    internal static class ZstOwnerSyncThrottle
+    {
+        // Fréquences réseau des PNJ RP. Ajustables.
+        internal static float NearInterval = 0.15f;   // < 30 m : ~7 Hz (fluidité des gardes)
+        internal static float MidInterval = 0.5f;     // 30..60 m : 2 Hz
+        internal static float FarInterval = 2f;       // > 60 m : 0.5 Hz (fond de décor)
+
+        private static readonly Dictionary<ZDOID, float> NextSync = new Dictionary<ZDOID, float>();
+        private static readonly Dictionary<ZDOID, bool> WasMoving = new Dictionary<ZDOID, bool>();
+        private static float _pruneTimer;
+
+        private static float IntervalFor(Vector3 pos)
+        {
+            float d = RpNetKeys.NearestPlayerDistance(pos);
+            if (d < 30f) return NearInterval;
+            if (d < 60f) return MidInterval;
+            return FarInterval;
+        }
+
+        [HarmonyPrefix]
+        [HarmonyPatch(typeof(ZSyncTransform), "OwnerSync")]
+        private static bool Prefix(ZSyncTransform __instance, ZNetView ___m_nview)
+        {
+            ZNetView nview = ___m_nview;
+            if (nview == null || !nview.IsValid() || !nview.IsOwner()) return true;
+            if (!RpNetKeys.IsRpNpc(nview)) return true;
+
+            ZDO zdo = nview.GetZDO();
+            ZDOID uid = zdo.m_uid;
+            float now = Time.time;
+
+            // prune légère : évite la croissance infinie du dictionnaire
+            if (_pruneTimer < now)
+            {
+                _pruneTimer = now + 10f;
+                List<ZDOID> dead = null;
+                foreach (KeyValuePair<ZDOID, float> kv in NextSync)
+                {
+                    if (ZDOMan.instance == null || ZDOMan.instance.GetZDO(kv.Key) == null)
+                        (dead ?? (dead = new List<ZDOID>())).Add(kv.Key);
+                }
+                if (dead != null)
+                    foreach (ZDOID id in dead) { NextSync.Remove(id); WasMoving.Remove(id); }
+            }
+
+            // PNJ à l'arrêt : on laisse passer une seule fois après l'arrêt
+            // (pour pousser la position finale), puis on bloque : ZDO.Set
+            // est no-op si la valeur n'a pas changé, mais SetPosition avec
+            // un micro-jitter du rigidbody peut rester sale.
+            Character character = __instance.GetComponent<Character>();
+            bool moving = character != null &&
+                          character.GetVelocity().sqrMagnitude > 0.04f; // > 0.2 m/s
+
+            bool wasMoving;
+            WasMoving.TryGetValue(uid, out wasMoving);
+            WasMoving[uid] = moving;
+
+            if (!moving && !wasMoving)
+            {
+                float nextIdle;
+                NextSync.TryGetValue(uid, out nextIdle);
+                if (now < nextIdle) return false;   // immobile : rien à pousser
+                NextSync[uid] = now + 2f;           // 1 rafraîchissement / 2 s à l'arrêt
+                return true;
+            }
+
+            float next;
+            NextSync.TryGetValue(uid, out next);
+            if (now < next) return false;           // skip ce frame -> ZDO non salie
+            NextSync[uid] = now + IntervalFor(__instance.transform.position);
+            return true;                            // OwnerSync original : SetPosition + Set("vel")
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 2) Throttle de Character.SyncVelocity ("BodyVelocity", 50 Hz)
+    // ---------------------------------------------------------------
+    [HarmonyPatch]
+    internal static class CharacterSyncVelocityThrottle
+    {
+        private static readonly Dictionary<ZDOID, float> Next = new Dictionary<ZDOID, float>();
+        private static readonly Dictionary<ZDOID, Vector3> LastSent = new Dictionary<ZDOID, Vector3>();
+
+        [HarmonyPrefix]
+        [HarmonyPatch(typeof(Character), "SyncVelocity")]
+        private static bool Prefix(Character __instance, ZNetView ___m_nview)
+        {
+            ZNetView nview = ___m_nview;
+            if (nview == null || !nview.IsValid() || !nview.IsOwner()) return true;
+            if (!RpNetKeys.IsRpNpc(nview)) return true;
+
+            ZDO zdo = nview.GetZDO();
+            ZDOID uid = zdo.m_uid;
+            float now = Time.time;
+            Vector3 vel = __instance.GetVelocity();
+
+            Vector3 last;
+            bool haveLast = LastSent.TryGetValue(uid, out last);
+
+            // on écrit si : vitesse a beaucoup changé (>0.3 m/s), ou timer 1 s
+            float next;
+            Next.TryGetValue(uid, out next);
+            bool bigChange = !haveLast || (vel - last).magnitude > 0.3f;
+            if (!bigChange && now < next) return false;
+
+            Next[uid] = now + 1f;
+            LastSent[uid] = vel;
+            return true;   // écriture originale
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 3) CPU hôte : étaler les recherches de cibles de travail de
+    //    Norsemen. Original : 1 scan complet de m_instances / 30 s
+    //    par Viking (+ ToList() de tout le monde = GC). On garde la
+    //    logique intacte mais on espace : intervalle aléatoire 45..90 s
+    //    par Viking (les Vikings ne cherchent plus tous en même temps).
+    // ---------------------------------------------------------------
+    [HarmonyPatch(typeof(VikingAI), "Awake")]
+    internal static class VikingAiAwakeStaggerReal
+    {
+        private static readonly System.Reflection.FieldInfo FInterval =
+            AccessTools.Field(typeof(VikingAI), "m_workTargetSearchInterval");
+
+        [HarmonyPostfix]
+        private static void Postfix(VikingAI __instance)
+        {
+            if (FInterval == null || FTimer == null) return;
+            // étale : chaque Viking cherche toutes les 45..90 s,
+            // désynchronisé par un offset initial aléatoire.
+            // (appliqué à tout VikingAI : le stagger ne change que la
+            // FRÉQUENCE de recherche de cibles, pas le comportement)
+            float interval = UnityEngine.Random.Range(45f, 90f);
+            FInterval.SetValue(__instance, interval);
+            FTimer.SetValue(__instance, UnityEngine.Random.Range(0f, interval));
+        }
+
+        private static readonly System.Reflection.FieldInfo FTimer =
+            AccessTools.Field(typeof(VikingAI), "m_workTargetSearchTimer");
+    }
+
+    // ---------------------------------------------------------------
+    // 4) CPU hôte + réseau : LivingNorsemen.CheckGuardThreats fait un
+    //    FindObjectsByType<Character> (scan de scène) par garde toutes
+    //    les 0.5 s. On mutualise : 1 scan max par seconde pour TOUS
+    //    les gardes.
+    //    -> patché par reflection (TypeByName) pour ne pas créer de
+    //    dépendance de compilation dure sur LivingNorsemen.dll.
+    // ---------------------------------------------------------------
+    internal static class GuardThreatSharedScan
+    {
+        private static float _lastScan;
+
+        public static void Apply(Harmony harmony)
+        {
+            try
+            {
+                System.Type t = AccessTools.TypeByName("LivingNorsemen.LivingNorseman");
+                if (t == null)
+                {
+                    ZLog.LogWarning("[RpNetThrottle] LivingNorsemen.LivingNorseman introuvable : scan gardes non mutualisé.");
+                    return;
+                }
+                // la build installée peut ne pas avoir CheckGuardThreats (fork) :
+                // ne JAMAIS appeler harmony.Patch avec une méthode null
+                MethodInfo m = AccessTools.Method(t, "CheckGuardThreats");
+                if (m == null)
+                {
+                    ZLog.LogWarning("[RpNetThrottle] LivingNorseman.CheckGuardThreats absent de cette build : scan gardes non mutualisé.");
+                    return;
+                }
+                harmony.Patch(m,
+                    prefix: new HarmonyMethod(AccessTools.Method(typeof(GuardThreatSharedScan), nameof(Prefix))));
+            }
+            catch (Exception ex)
+            {
+                ZLog.LogWarning($"[RpNetThrottle] scan gardes non mutualisé: {ex.Message}");
+            }
+        }
+
+        private static bool Prefix()
+        {
+            if (Time.time - _lastScan < 1f) return false;   // skip ce garde
+            _lastScan = Time.time;
+            return true;                                    // 1 scan/s partagé
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 5) Hygiène ZDO : Norsemen écrit "lastWorkTime" en DateTime.Ticks
+    //    (long) à chaque action de travail -> dirty continu -> blob
+    //    complet re-envoyé. On n'autorise l'écriture que si la seconde
+    //    a changé (les cooldowns travaillent à la seconde près).
+    // ---------------------------------------------------------------
+    [HarmonyPatch(typeof(ZDO), "Set", new[] { typeof(int), typeof(long) })]
+    internal static class ZdoLongWriteDamp
+    {
+        [HarmonyPrefix]
+        private static bool Prefix(ZDO __instance, int hash, long value)
+        {
+            if (hash != VikingVars.lastWorkTime) return true;
+            long old = __instance.GetLong(hash, 0L);
+            if (old == 0L) return true;
+            long delta = value - old;
+            if (delta < 0L) return true;                      // horloge retournée : on passe
+            if (delta < System.TimeSpan.TicksPerSecond) return false;  // < 1 s : no-op
+            return true;
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Instrumentation : compte ce qui est réellement envoyé par peer.
+    // Active via la commande "rp_netstats on" (voir RegisterCommands).
+    // ---------------------------------------------------------------
+    [HarmonyPatch]
+    internal static class RpNetStats
+    {
+        internal static bool Enabled;
+        internal static long SentZdos;        // nb de ZDO sérialisés/envoyés
+        internal static long SentBytes;       // taille approximative des blobs
+        private static float _nextReport;
+
+        // comptage par appel de sérialisation (1 par ZDO envoyé à un peer)
+        // NB : en solo, ZDOMan.m_peers est vide -> 0 => le compteur permet
+        // de comparer solo vs multi directement.
+        // Mesure EXACTE : le postfix lit la taille du ZPackage rempli par la
+        // sérialisation originale (le blob complet, sans reflection sur les
+        // dictionnaires privés de ZDO).
+        // NB : la sauvegarde du monde (SaveWorld) sérialise aussi les ZDO ->
+        // pics ponctuels dans le compteur, identifiables (rare, rafale unique).
+        [HarmonyPostfix]
+        [HarmonyPatch(typeof(ZDO), "Serialize")]
+        private static void SerializePostfix(ZPackage pkg)
+        {
+            if (!Enabled || pkg == null) return;
+            SentZdos++;
+            SentBytes += pkg.Size();
+        }
+
+        // rapport périodique dans la console (appelé par ManagerNPCRP.Update)
+        public static void Report()
+        {
+            if (!Enabled) return;
+            float now = Time.time;
+            if (now < _nextReport) return;
+            _nextReport = now + 5f;
+            float sentZdosPerSec = SentZdos / 5f;
+            float kbPerSec = SentBytes / 5f / 1024f;
+            string line = $"[rp_net] ~{sentZdosPerSec:0} ZDO/s sérialisés, " +
+                          $"~{kbPerSec:0} Ko/s de blobs ZDO";
+            if (Console.instance != null) Console.instance.Print(line);
+            else ZLog.Log(line);
+            SentZdos = 0;
+            SentBytes = 0;
         }
     }
 }
