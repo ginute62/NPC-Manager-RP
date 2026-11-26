@@ -299878,7 +299878,8 @@
             "type": "talk",
             "npc": "NPC-212",
             "text": "Parler à Renégat (Itinerants)",
-            "requiresActiveFlag": "qactive_Q_REN_Intro_01"
+            "requiresActiveFlag": "qactive_Q_REN_Intro_01",
+            "id": "o1"
           }
         ],
         "rewards": {
@@ -299936,7 +299937,8 @@
             "type": "collect",
             "item": "Wood",
             "count": 8,
-            "text": "Collecter 8 Wood"
+            "text": "Collecter 8 Wood",
+            "id": "o1"
           }
         ],
         "rewards": {
@@ -299999,7 +300001,8 @@
               "z": 15.0
             },
             "radius": 8.0,
-            "text": "Escorter Renégat jusqu'au dépôt"
+            "text": "Escorter Renégat jusqu'au dépôt",
+            "id": "o1"
           }
         ],
         "rewards": {
@@ -300060,7 +300063,8 @@
               "Neck",
               "Boar"
             ],
-            "text": "Abattre 4 créatures (Neck / Boar)"
+            "text": "Abattre 4 créatures (Neck / Boar)",
+            "id": "o1"
           }
         ],
         "rewards": {
@@ -300118,7 +300122,8 @@
             "type": "talk",
             "npc": "NPC-151",
             "text": "Parler à Camarade Azuré (Fensalir)",
-            "requiresActiveFlag": "qactive_Q_AZU_Intro_01"
+            "requiresActiveFlag": "qactive_Q_AZU_Intro_01",
+            "id": "o1"
           }
         ],
         "rewards": {
@@ -300176,7 +300181,8 @@
             "type": "collect",
             "item": "Wood",
             "count": 8,
-            "text": "Collecter 8 Wood"
+            "text": "Collecter 8 Wood",
+            "id": "o1"
           }
         ],
         "rewards": {
@@ -300239,7 +300245,8 @@
               "z": 2865.0
             },
             "radius": 8.0,
-            "text": "Escorter Camarade Azuré jusqu'au dépôt"
+            "text": "Escorter Camarade Azuré jusqu'au dépôt",
+            "id": "o1"
           }
         ],
         "rewards": {
@@ -300300,7 +300307,8 @@
               "Neck",
               "Boar"
             ],
-            "text": "Abattre 4 créatures (Neck / Boar)"
+            "text": "Abattre 4 créatures (Neck / Boar)",
+            "id": "o1"
           }
         ],
         "rewards": {
@@ -300358,7 +300366,8 @@
             "type": "talk",
             "npc": "NPC-021",
             "text": "Parler à Homme des Douze (Rochouard)",
-            "requiresActiveFlag": "qactive_Q_DOU_Intro_01"
+            "requiresActiveFlag": "qactive_Q_DOU_Intro_01",
+            "id": "o1"
           }
         ],
         "rewards": {
@@ -300416,7 +300425,8 @@
             "type": "collect",
             "item": "Wood",
             "count": 8,
-            "text": "Collecter 8 Wood"
+            "text": "Collecter 8 Wood",
+            "id": "o1"
           }
         ],
         "rewards": {
@@ -300479,7 +300489,8 @@
               "z": -185.0
             },
             "radius": 8.0,
-            "text": "Escorter Homme des Douze jusqu'au dépôt"
+            "text": "Escorter Homme des Douze jusqu'au dépôt",
+            "id": "o1"
           }
         ],
         "rewards": {
@@ -300540,7 +300551,8 @@
               "Neck",
               "Boar"
             ],
-            "text": "Abattre 4 créatures (Neck / Boar)"
+            "text": "Abattre 4 créatures (Neck / Boar)",
+            "id": "o1"
           }
         ],
         "rewards": {
@@ -300598,7 +300610,8 @@
             "type": "talk",
             "npc": "NPC-171",
             "text": "Parler à Fidèle de la Horde (Skipavi)",
-            "requiresActiveFlag": "qactive_Q_HOR_Intro_01"
+            "requiresActiveFlag": "qactive_Q_HOR_Intro_01",
+            "id": "o1"
           }
         ],
         "rewards": {
@@ -300656,7 +300669,8 @@
             "type": "collect",
             "item": "Wood",
             "count": 8,
-            "text": "Collecter 8 Wood"
+            "text": "Collecter 8 Wood",
+            "id": "o1"
           }
         ],
         "rewards": {
@@ -300719,7 +300733,8 @@
               "z": -7285.0
             },
             "radius": 8.0,
-            "text": "Escorter Fidèle de la Horde jusqu'au dépôt"
+            "text": "Escorter Fidèle de la Horde jusqu'au dépôt",
+            "id": "o1"
           }
         ],
         "rewards": {
@@ -300780,7 +300795,8 @@
               "Neck",
               "Boar"
             ],
-            "text": "Abattre 4 créatures (Neck / Boar)"
+            "text": "Abattre 4 créatures (Neck / Boar)",
+            "id": "o1"
           }
         ],
         "rewards": {
@@ -300838,7 +300854,8 @@
             "type": "talk",
             "npc": "NPC-111",
             "text": "Parler à Antagoniste (Ankaria)",
-            "requiresActiveFlag": "qactive_Q_ANT_Intro_01"
+            "requiresActiveFlag": "qactive_Q_ANT_Intro_01",
+            "id": "o1"
           }
         ],
         "rewards": {
@@ -300896,7 +300913,8 @@
             "type": "collect",
             "item": "Wood",
             "count": 8,
-            "text": "Collecter 8 Wood"
+            "text": "Collecter 8 Wood",
+            "id": "o1"
           }
         ],
         "rewards": {
@@ -300959,7 +300977,8 @@
               "z": 2070.0
             },
             "radius": 8.0,
-            "text": "Escorter Antagoniste jusqu'au dépôt"
+            "text": "Escorter Antagoniste jusqu'au dépôt",
+            "id": "o1"
           }
         ],
         "rewards": {
@@ -301020,7 +301039,8 @@
               "Neck",
               "Boar"
             ],
-            "text": "Abattre 4 créatures (Neck / Boar)"
+            "text": "Abattre 4 créatures (Neck / Boar)",
+            "id": "o1"
           }
         ],
         "rewards": {

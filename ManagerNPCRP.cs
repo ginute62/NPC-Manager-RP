@@ -6665,12 +6665,17 @@ namespace NorsemanNpcRp
             foreach (string p in q.prevQuests) if (!Quests.ContainsKey(p)) e.Add("unknown prerequisite quest '" + p + "'");
             foreach (string n in q.next) if (!Quests.ContainsKey(n)) e.Add("unknown next quest '" + n + "'");
             foreach (KeyValuePair<string, int> it in q.rewardItems) if (string.IsNullOrEmpty(it.Key) || it.Value < 1) e.Add("invalid reward item");
-            if (q.repClanPoints > 0)
+            // spec 4.3 : si rewards.reputation.clan est défini, la ligne reputation.rewards
+            // est créée par le chemin direct (après parse) — pas de warning ici.
+            // Sinon, la réputation passe par une ligne statique keyée sur le flag de la
+            // carrière de la quête (pas seulement "renegat").
+            if (q.repClanPoints > 0 && string.IsNullOrEmpty(q.repClan))
             {
+                string repCareer = q.careers.Count > 0 ? q.careers[0] : "renegat";
                 ReputationSettings r = db.reputation;
                 bool anyRow = false;
-                foreach (RepReward rw in r.rewards) if (string.Equals(rw.flag, RewardFlag(q, "renegat"), StringComparison.OrdinalIgnoreCase)) { anyRow = true; break; }
-                if (!anyRow) plugin.Log.LogWarning("[QUEST] " + q.id + ": repClanPoints=" + q.repClanPoints + " but no reputation.rewards row for flag '" + RewardFlag(q, "renegat") + "' (no reputation will be paid).");
+                foreach (RepReward rw in r.rewards) if (string.Equals(rw.flag, RewardFlag(q, repCareer), StringComparison.OrdinalIgnoreCase)) { anyRow = true; break; }
+                if (!anyRow) plugin.Log.LogWarning("[QUEST] " + q.id + ": repClanPoints=" + q.repClanPoints + " but no reputation.rewards row for flag '" + RewardFlag(q, repCareer) + "' (no reputation will be paid).");
             }
             return e;
         }
