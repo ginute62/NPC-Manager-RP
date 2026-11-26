@@ -1,7 +1,8 @@
 Credit dependencies https://github.com/Sephrin9999 and https://github.com/RustyMods/VikingNPC
+an ty MidnightMods for fix vanilla network.
 # Norseman NPC RP order files paths
-        -place Norseman NPC RP.dll, Norseman and living Norseman on /bepinex/plugins 
-        -Place in Bepinex/config : Npc_database.json, populationstate.json, reputationstate.json
+        -place Norseman NPC RP.dll, Norseman and living Norseman on /bepinex/plugins (any file dll)
+        -Place in Bepinex/config : Npc_database.json, populationstate.json, reputationstate.json (and item_prefab.csv for the database can be able to match id to give loot. useful for quest rewards in inventory)
 **Norseman NPC RP** is a BepInEx mod for *Valheim* that turns Norsemen NPCs into persistent roleplay characters: identity, clan, faction, dialogue, quests, reputation, PvP, companies, and dynamic population.
         All mod content is driven by one JSON database:
 BepInEx/config/Norseman-NPC-RP/npcdatabase.json
