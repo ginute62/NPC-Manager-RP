@@ -1,5 +1,9 @@
 Credit dependencies https://github.com/Sephrin9999 and https://github.com/RustyMods/VikingNPC
 an ty MidnightMods for fix vanilla network.
+For the keys , T for Talk, O for journal quest menu
+tips: 
+- think to reset calendar (F5- devcommands- Skiptime -X) for quest progression
+- yu can reset PLayerKeys for boss achivement. but a new player for this mod is recommanded if yu want to play with Vanilla raids.
 # Norseman NPC RP order files paths
         -place Norseman NPC RP.dll, Norseman and living Norseman on /bepinex/plugins (any file dll)
         -Place in Bepinex/config : Npc_database.json, populationstate.json, reputationstate.json (and item_prefab.csv for the database can be able to match id to give loot. useful for quest rewards in inventory)
